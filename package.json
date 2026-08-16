@@ -1,0 +1,20 @@
+{
+  "name": "offlinequeue",
+  "version": "0.0.0",
+  "description": "A durable queue of the changes a mobile app made while offline: persisted, retried with backoff, idempotent, and unable to be blocked by one rejected change.",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "exports": { ".": "./src/index.ts" },
+  "files": ["src", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "demo": "node example/demo.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.4",
+    "typescript": "^7.0.2"
+  },
+  "keywords": ["react-native", "offline", "queue", "sync", "idempotency", "retry", "backoff"]
+}
