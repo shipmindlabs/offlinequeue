@@ -91,6 +91,21 @@ test("a restart does not reset the backoff", async () => {
   assert.equal(wire.seen.length, 0, "the delay is still in force after the restart");
 });
 
+// Persisting a one-element queue over everything that survived the last run:
+// the data-loss path for a caller who forgets load() before enqueueing.
+test("enqueueing before load does not overwrite the stored queue", async () => {
+  const storage = memoryStorage();
+  const overnight = queue({ storage, send: async () => ({ result: "retry", reason: "offline" }) });
+  await overnight.enqueue("note", { text: "survived the night" });
+
+  // A new process enqueues straight away, without calling load() first.
+  const forgetful = queue({ storage, send: async () => ({ result: "done" }) });
+  await forgetful.enqueue("note", { text: "fresh" });
+
+  assert.equal((await storage.load()).length, 2, "the overnight change must still be there");
+  assert.equal(forgetful.outstanding.length, 2);
+});
+
 // An operation that was in flight when the process died has an unknown fate.
 // It must be retried, and the idempotency key is what makes that safe.
 test("an interrupted attempt is retried under the same idempotency key", async () => {

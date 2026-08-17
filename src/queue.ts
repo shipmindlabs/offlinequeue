@@ -117,6 +117,7 @@ export class OfflineQueue {
 
   /** Read what survived the app being killed. */
   async load(): Promise<void> {
+    if (this.#loaded) return;
     const stored = await this.#options.storage.load();
     // An operation left in flight when the process died has an unknown fate:
     // the server may or may not have applied it. It goes back to pending, and
@@ -127,8 +128,15 @@ export class OfflineQueue {
     this.#loaded = true;
   }
 
-  /** Record a change. It is persisted before this resolves. */
+  /**
+   * Record a change. It is persisted before this resolves.
+   *
+   * Loads first when the caller has not: persisting before loading would write
+   * a one-element queue over everything that survived the last run, and a
+   * forgotten load() must not be a way to lose a night's changes.
+   */
   async enqueue<T>(kind: string, payload: T, idempotencyKey?: string): Promise<Operation<T>> {
+    await this.load();
     const operation: Operation<T> = {
       id: this.#options.newId(),
       kind,
@@ -151,7 +159,7 @@ export class OfflineQueue {
    * other, so one stuck upload does not hold up a note.
    */
   async flush(): Promise<FlushReport> {
-    if (!this.#loaded) await this.load();
+    await this.load();
 
     const now = this.#options.now();
     let sent = 0;
@@ -227,12 +235,14 @@ export class OfflineQueue {
 
   /** Drop a parked operation, e.g. after the user acknowledges it. */
   async discard(id: string): Promise<void> {
+    await this.load();
     this.#operations = this.#operations.filter((operation) => operation.id !== id);
     await this.#persist();
   }
 
   /** Forget accepted operations. Nothing else is removed. */
   async prune(): Promise<void> {
+    await this.load();
     this.#operations = this.#operations.filter((operation) => operation.state !== "done");
     await this.#persist();
   }
