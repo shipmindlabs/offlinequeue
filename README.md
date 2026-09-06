@@ -70,11 +70,27 @@ The three outcomes are the whole contract. `done` and `retry` are obvious;
 **`rejected` is the one that matters** — it means the server will never accept
 this, so retrying is pointless and blocking the queue behind it helps nobody.
 
+## Storage
+
+A change becomes a stored row before any network call, so the store is the one
+piece that has to be real. Three adapters answer the same interface, and the
+choice is one line:
+
+```ts
+keyValueStorage(AsyncStorage)  // anything with getItem/setItem
+mmkvStorage(new MMKV())        // the same two operations, synchronous
+memoryStorage()                // tests, and a first run before storage is wired
+```
+
+A second argument names the key, because two queues in one app must not share
+one. Writing your own adapter is two methods, `load` and `save`.
+
 ## No React Native import
 
-Storage and transport arrive as functions. `AsyncStorage` fits `keyValueStore`
-without this package knowing it exists, which is why every behaviour above is
-tested in a plain test runner rather than needing a device.
+Storage and transport arrive as functions. `AsyncStorage` fits `KeyValueStore`
+and MMKV fits `SyncKeyValueStore` without this package knowing either exists,
+which is why every behaviour above is tested in a plain test runner rather than
+needing a device.
 
 It also means the same queue runs in a web app, a worker, or a server-side test
 of your own sync logic.
@@ -94,7 +110,7 @@ exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, exponential backoff with jitter and a ceiling, idempotency keys across restarts, rejection parking, per-kind ordering, attempt limit, prune and discard |
+| Implemented | durable enqueue, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with jitter and a ceiling, idempotency keys across restarts, rejection parking, per-kind ordering, attempt limit, prune and discard |
 | Not yet | a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `flush` on connectivity change, encryption at rest |
 
 ## Development
@@ -107,4 +123,4 @@ npm run typecheck
 
 ## License
 
-MIT
+MIT © [Shipmind Labs](https://shipmindlabs.com)

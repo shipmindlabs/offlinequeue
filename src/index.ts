@@ -14,4 +14,10 @@ export {
   type Storage,
 } from "./queue.ts";
 
-export { keyValueStorage, memoryStorage, type KeyValueStore } from "./storage.ts";
+export {
+  keyValueStorage,
+  memoryStorage,
+  mmkvStorage,
+  type KeyValueStore,
+  type SyncKeyValueStore,
+} from "./storage.ts";
