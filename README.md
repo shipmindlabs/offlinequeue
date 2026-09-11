@@ -33,8 +33,11 @@ at the same instant and hands the outage back to the server as a thundering
 herd.
 
 **A timeout is retried and the server applies it twice.** Two identical charges.
-Every operation carries an `idempotencyKey` that survives restarts, and an
-operation interrupted mid-flight is retried under the same one.
+Every operation carries an `idempotencyKey` that survives restarts. An attempt
+also records when it started, so a change still in flight when the process died
+is recognised on the next start and returned to pending once its lease has run
+out — retried under the same key, and not while the first request may still be
+on the wire.
 
 **One rejected change blocks everything.** A validation error retried for ever
 with the rest of the queue behind it. Here a rejection is parked for a person to
@@ -69,6 +72,11 @@ await queue.flush();
 The three outcomes are the whole contract. `done` and `retry` are obvious;
 **`rejected` is the one that matters** — it means the server will never accept
 this, so retrying is pointless and blocking the queue behind it helps nobody.
+
+`load` reclaims abandoned attempts on the way in, and `recover` does the same
+thing on demand; both are safe to call again, since a reclaim changes nothing
+the second time. Set `leaseMs` longer than the slowest request your transport
+will allow.
 
 ## Storage
 
@@ -110,7 +118,7 @@ exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with jitter and a ceiling, idempotency keys across restarts, rejection parking, per-kind ordering, attempt limit, prune and discard |
+| Implemented | durable enqueue, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with jitter and a ceiling, idempotency keys across restarts, in-flight leases with idempotent recovery of abandoned attempts, rejection parking, per-kind ordering, attempt limit, prune and discard |
 | Not yet | a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `flush` on connectivity change, encryption at rest |
 
 ## Development

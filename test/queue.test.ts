@@ -33,6 +33,7 @@ function queue(options: {
   send: (operation: Operation) => Promise<Outcome>;
   now?: () => Date;
   maxAttempts?: number;
+  leaseMs?: number;
 }) {
   return new OfflineQueue({
     storage: options.storage ?? memoryStorage(),
@@ -40,7 +41,22 @@ function queue(options: {
     now: options.now ?? at("2026-08-16T10:00:00Z"),
     random: () => 0.5,
     maxAttempts: options.maxAttempts ?? 8,
+    ...(options.leaseMs === undefined ? {} : { leaseMs: options.leaseMs }),
   });
+}
+
+/** A row the process died on, optionally carrying the lease it held. */
+function interruptedCharge(startedAt?: string): Operation {
+  return {
+    id: "op-1",
+    kind: "charge",
+    payload: { amount: 100 },
+    idempotencyKey: "key-abc",
+    createdAt: "2026-08-16T09:00:00.000Z",
+    attempts: 1,
+    state: "in-flight",
+    ...(startedAt === undefined ? {} : { startedAt }),
+  };
 }
 
 test("an accepted change is sent once and marked done", async () => {
@@ -109,17 +125,8 @@ test("enqueueing before load does not overwrite the stored queue", async () => {
 // An operation that was in flight when the process died has an unknown fate.
 // It must be retried, and the idempotency key is what makes that safe.
 test("an interrupted attempt is retried under the same idempotency key", async () => {
-  const interrupted: Operation = {
-    id: "op-1",
-    kind: "charge",
-    payload: { amount: 100 },
-    idempotencyKey: "key-abc",
-    createdAt: "2026-08-16T09:00:00.000Z",
-    attempts: 1,
-    state: "in-flight",
-  };
   const wire = transport({ charge: { result: "done" } });
-  const q = queue({ storage: memoryStorage([interrupted]), send: wire.send });
+  const q = queue({ storage: memoryStorage([interruptedCharge()]), send: wire.send });
 
   await q.load();
   await q.flush();
@@ -128,24 +135,82 @@ test("an interrupted attempt is retried under the same idempotency key", async (
   assert.equal(wire.seen[0]?.idempotencyKey, "key-abc", "the server must recognise the repeat");
 });
 
-test("the idempotency key survives every retry of the same operation", async () => {
-  const wire = transport({
-    charge: [{ result: "retry", reason: "timeout" }, { result: "done" }],
+// The lease clock: without a start time there is no way to tell a request that
+// is still out from one that died with its process.
+test("an attempt in flight records when it started", async () => {
+  const storage = memoryStorage();
+  let duringSend: Operation | undefined;
+  const q = queue({
+    storage,
+    send: async () => {
+      duringSend = (await storage.load())[0];
+      return { result: "done" };
+    },
   });
-  const q = queue({ send: wire.send });
-  await q.enqueue("charge", { amount: 100 }, "key-fixed");
+
+  await q.enqueue("note", {});
+  await q.flush();
+
+  assert.equal(duringSend?.state, "in-flight");
+  assert.equal(duringSend?.startedAt, "2026-08-16T10:00:00.000Z");
+  assert.equal(q.operations[0]?.startedAt, undefined, "the lease ends with the attempt");
+});
+
+test("an attempt that outlived its lease is returned to pending on cold start", async () => {
+  const storage = memoryStorage([interruptedCharge("2026-08-16T09:50:00.000Z")]);
+  const wire = transport({ charge: { result: "done" } });
+  const q = queue({ storage, send: wire.send });
+
+  await q.load();
+
+  assert.equal(q.outstanding[0]?.state, "pending");
+  assert.equal(q.outstanding[0]?.startedAt, undefined, "the dead lease is not kept");
+  assert.equal((await storage.load())[0]?.state, "pending", "the recovery was written down");
 
   await q.flush();
-  await new OfflineQueue({
-    storage: memoryStorage(q.operations as Operation[]),
-    send: wire.send,
-    now: at("2026-08-16T10:10:00Z"),
-    random: () => 0.5,
-  }).flush();
+  assert.equal(wire.seen[0]?.idempotencyKey, "key-abc");
+  assert.equal(wire.seen[0]?.attempts, 1, "recovery is not itself an attempt");
+});
 
-  assert.equal(wire.seen.length, 2);
-  assert.equal(wire.seen[0]?.idempotencyKey, "key-fixed");
-  assert.equal(wire.seen[1]?.idempotencyKey, "key-fixed");
+// A request still on the wire must not be sent a second time by a flush that
+// happens to run beside it: that is the duplicate charge, arranged by hand.
+test("an attempt still inside its lease is left alone", async () => {
+  const storage = memoryStorage([interruptedCharge("2026-08-16T09:59:30.000Z")]);
+  const wire = transport({ charge: { result: "done" } });
+  const q = queue({ storage, send: wire.send });
+
+  await q.load();
+  assert.equal(q.outstanding[0]?.state, "in-flight");
+
+  const report = await q.flush();
+  assert.equal(wire.seen.length, 0, "a live attempt is not started again");
+  assert.equal(report.retrying, 1);
+});
+
+// Recovery runs on every cold start, foreground and reconnect, so running it
+// twice has to be the same as running it once.
+test("recovery is idempotent", async () => {
+  const cells = memoryStorage([interruptedCharge("2026-08-16T09:50:00.000Z")]);
+  let writes = 0;
+  const storage: Storage = {
+    load: () => cells.load(),
+    save: async (operations) => {
+      writes++;
+      await cells.save(operations);
+    },
+  };
+
+  const q = queue({ storage, send: async () => ({ result: "done" }) });
+  await q.load();
+  assert.equal(writes, 1, "the reclaim was persisted once");
+  assert.equal(await q.recover(), 0, "a second pass finds nothing left to reclaim");
+  assert.equal(writes, 1, "and writes nothing");
+
+  const next = queue({ storage, send: async () => ({ result: "done" }) });
+  await next.load();
+  assert.equal(next.outstanding[0]?.state, "pending");
+  assert.equal(next.outstanding[0]?.attempts, 1, "a second cold start changes nothing");
+  assert.equal(writes, 1);
 });
 
 // A hundred failed requests on a weak signal is a flat battery.

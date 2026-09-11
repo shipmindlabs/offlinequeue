@@ -37,6 +37,12 @@ export type Operation<T = unknown> = {
   readonly lastError?: string;
   /** Earliest time to try again, from the backoff. */
   readonly nextAttemptAt?: string;
+  /**
+   * When the attempt now in flight began, present only while it is in flight.
+   * This is the lease clock: it is how a cold start tells an attempt that is
+   * still running from one that died with the process that started it.
+   */
+  readonly startedAt?: string;
 };
 
 /** Somewhere the queue survives the app being killed. */
@@ -69,6 +75,12 @@ export type QueueOptions = {
   readonly maxDelayMs?: number;
   /** After this many attempts an operation is parked as failed. */
   readonly maxAttempts?: number;
+  /**
+   * How long an attempt is believed to be alive. Past it, a row still in
+   * flight is treated as the remains of a process that died mid-request and is
+   * returned to pending. Longer than the slowest request the transport allows.
+   */
+  readonly leaseMs?: number;
   readonly now?: () => Date;
   /** Injectable so a test is not at the mercy of a random. */
   readonly random?: () => number;
@@ -94,6 +106,7 @@ export class OfflineQueue {
       baseDelayMs: 1000,
       maxDelayMs: 5 * 60 * 1000,
       maxAttempts: 8,
+      leaseMs: 2 * 60 * 1000,
       now: () => new Date(),
       random: Math.random,
       newId: () => `op-${++this.#counter}`,
@@ -115,17 +128,38 @@ export class OfflineQueue {
     return this.#operations.filter((o) => o.state === "failed");
   }
 
-  /** Read what survived the app being killed. */
+  /** Read what survived the app being killed, and reclaim what it interrupted. */
   async load(): Promise<void> {
     if (this.#loaded) return;
-    const stored = await this.#options.storage.load();
-    // An operation left in flight when the process died has an unknown fate:
-    // the server may or may not have applied it. It goes back to pending, and
-    // the idempotency key is what makes that safe.
-    this.#operations = stored.map((operation) =>
-      operation.state === "in-flight" ? { ...operation, state: "pending" as const } : operation,
-    );
+    this.#operations = await this.#options.storage.load();
     this.#loaded = true;
+    await this.recover();
+  }
+
+  /**
+   * Return abandoned attempts to pending, and answer how many were reclaimed.
+   *
+   * An operation left in flight has an unknown fate: the server may or may not
+   * have applied it. Until the lease runs out the attempt is assumed to still
+   * be running, so it is not sent a second time; after it, the attempt is taken
+   * to have died with its process and the row goes back to pending, where the
+   * idempotency key is what makes sending it again safe.
+   *
+   * Reclaiming changes nothing but the state, so a second pass finds nothing
+   * and writes nothing. Safe to call on every cold start, foreground or
+   * reconnect.
+   */
+  async recover(): Promise<number> {
+    await this.load();
+    const now = this.#options.now().getTime();
+    const stuck = this.#operations.filter(
+      (operation) => operation.state === "in-flight" && this.#leaseExpired(operation, now),
+    );
+    for (const operation of stuck) {
+      this.#replace(operation.id, { state: "pending", startedAt: undefined });
+    }
+    if (stuck.length > 0) await this.#persist();
+    return stuck.length;
   }
 
   /**
@@ -170,18 +204,29 @@ export class OfflineQueue {
     for (const operation of [...this.#operations]) {
       if (operation.state === "done" || operation.state === "failed") continue;
       if (blocked.has(operation.kind)) continue;
+      if (operation.state === "in-flight" && !this.#leaseExpired(operation, now.getTime())) {
+        // An attempt inside its lease is still out on the wire. Sending it
+        // again is the duplicate the whole idempotency story exists to avoid.
+        retrying++;
+        blocked.add(operation.kind);
+        continue;
+      }
       if (operation.nextAttemptAt && new Date(operation.nextAttemptAt) > now) {
         retrying++;
         blocked.add(operation.kind);
         continue;
       }
 
-      this.#replace(operation.id, { state: "in-flight" });
+      this.#replace(operation.id, { state: "in-flight", startedAt: now.toISOString() });
       await this.#persist();
 
       const outcome = await this.#attempt(operation);
       if (outcome.result === "done") {
-        this.#replace(operation.id, { state: "done", attempts: operation.attempts + 1 });
+        this.#replace(operation.id, {
+          state: "done",
+          attempts: operation.attempts + 1,
+          startedAt: undefined,
+        });
         sent++;
         continue;
       }
@@ -193,6 +238,7 @@ export class OfflineQueue {
           state: "failed",
           attempts: operation.attempts + 1,
           lastError: outcome.reason,
+          startedAt: undefined,
         });
         rejected++;
         continue;
@@ -200,7 +246,12 @@ export class OfflineQueue {
 
       const attempts = operation.attempts + 1;
       if (attempts >= this.#options.maxAttempts) {
-        this.#replace(operation.id, { state: "failed", attempts, lastError: outcome.reason });
+        this.#replace(operation.id, {
+          state: "failed",
+          attempts,
+          lastError: outcome.reason,
+          startedAt: undefined,
+        });
         rejected++;
         continue;
       }
@@ -210,6 +261,7 @@ export class OfflineQueue {
         attempts,
         lastError: outcome.reason,
         nextAttemptAt: new Date(now.getTime() + this.delayFor(attempts)).toISOString(),
+        startedAt: undefined,
       });
       retrying++;
       // Later operations of the same kind wait, so ordering survives.
@@ -247,6 +299,16 @@ export class OfflineQueue {
     await this.#persist();
   }
 
+  #leaseExpired(operation: Operation, now: number): boolean {
+    // A row in flight without a start time was written by a version that did
+    // not record one. Its age is unknown, so it is reclaimed rather than left
+    // to sit in flight for ever.
+    if (!operation.startedAt) return true;
+    const startedAt = new Date(operation.startedAt).getTime();
+    if (Number.isNaN(startedAt)) return true;
+    return now - startedAt >= this.#options.leaseMs;
+  }
+
   async #attempt(operation: Operation): Promise<Outcome> {
     try {
       return await this.#options.send(operation);
@@ -258,9 +320,17 @@ export class OfflineQueue {
   }
 
   #replace(id: string, changes: Partial<Operation>): void {
-    this.#operations = this.#operations.map((operation) =>
-      operation.id === id ? { ...operation, ...changes } : operation,
-    );
+    this.#operations = this.#operations.map((operation): Operation => {
+      if (operation.id !== id) return operation;
+      const next = { ...operation, ...changes };
+      if (next.startedAt === undefined) {
+        // A stored `startedAt: undefined` is a key, and a key that survives the
+        // attempt would claim a lease over a row that is no longer in flight.
+        const { startedAt: ended, ...rest } = next;
+        return rest;
+      }
+      return next;
+    });
   }
 
   async #persist(): Promise<void> {
