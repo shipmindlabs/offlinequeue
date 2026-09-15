@@ -9,6 +9,7 @@ export {
   type Operation,
   type OperationState,
   type Outcome,
+  type ParkedReason,
   type QueueOptions,
   type Send,
   type Storage,

@@ -18,7 +18,7 @@ the app is killed by the OS, and reopened five minutes later
   arrived at the server: photo (id-2), note (id-6)
 
 parked for the user to deal with:
-  note: title is required (after 2 attempt)
+  note: title is required (rejected after 2 attempts)
 
   the rejected note did not hold up the good one behind it
 ```
@@ -28,9 +28,9 @@ nothing says so. Here every change is persisted before `enqueue` resolves.
 
 **No backoff.** A phone that regains a weak signal sends a hundred failed
 requests and flattens the battery. Here the delay doubles, is capped, and
-carries jitter — without which every phone that lost the same cell tower retries
-at the same instant and hands the outage back to the server as a thundering
-herd.
+carries jitter drawn per change — without which every phone that lost the same
+cell tower retries at the same instant and hands the outage back to the server
+as a thundering herd.
 
 **A timeout is retried and the server applies it twice.** Two identical charges.
 Every operation carries an `idempotencyKey` that survives restarts. An attempt
@@ -41,7 +41,9 @@ on the wire.
 
 **One rejected change blocks everything.** A validation error retried for ever
 with the rest of the queue behind it. Here a rejection is parked for a person to
-deal with, and other work continues.
+deal with, and other work continues. A change that merely ran out of attempts is
+parked too, since a delay that doubles for ever is still a queue that never
+stops trying.
 
 ## Use
 
@@ -77,6 +79,18 @@ this, so retrying is pointless and blocking the queue behind it helps nobody.
 thing on demand; both are safe to call again, since a reclaim changes nothing
 the second time. Set `leaseMs` longer than the slowest request your transport
 will allow.
+
+## The parking lane
+
+`queue.failed` is everything that stopped, which is what a "these did not sync"
+screen lists. A parked change keeps the error that stopped it in `lastError` and
+says which of the two things happened in `parkedReason`: `rejected` needs a
+person, `exhausted` ran out of `maxAttempts` and may only need a better network.
+A parked row carries no `nextAttemptAt`, because nothing is coming.
+
+There are two ways out. `discard(id)` drops it, and `retry(id)` puts it back in
+the queue with its attempt count reset — under the original idempotency key, so
+a change the server did receive is still not applied twice.
 
 ## Storage
 
@@ -118,7 +132,7 @@ exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with jitter and a ceiling, idempotency keys across restarts, in-flight leases with idempotent recovery of abandoned attempts, rejection parking, per-kind ordering, attempt limit, prune and discard |
+| Implemented | durable enqueue, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, idempotency keys across restarts, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, per-kind ordering, prune |
 | Not yet | a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `flush` on connectivity change, encryption at rest |
 
 ## Development

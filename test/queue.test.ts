@@ -5,6 +5,7 @@ import {
   memoryStorage,
   OfflineQueue,
   keyValueStorage,
+  type FlushReport,
   type KeyValueStore,
   type Operation,
   type Outcome,
@@ -66,7 +67,7 @@ test("an accepted change is sent once and marked done", async () => {
   await q.enqueue("note", { text: "hello" });
   const report = await q.flush();
 
-  assert.deepEqual(report, { sent: 1, rejected: 0, retrying: 0, remaining: false });
+  assert.deepEqual(report, { sent: 1, rejected: 0, exhausted: 0, retrying: 0, remaining: false });
   assert.equal(wire.seen.length, 1);
   assert.equal(q.outstanding.length, 0);
 });
@@ -224,6 +225,26 @@ test("retries back off exponentially, with a ceiling", async () => {
   assert.equal(q.delayFor(10), Math.round(5 * 60 * 1000 * 0.75), "capped at the maximum");
 });
 
+// One draw for the whole queue would bring every change back at the same
+// instant: the thundering herd, in miniature, inside one device.
+test("the jitter is drawn per item", async () => {
+  const draws = [0, 1];
+  const q = new OfflineQueue({
+    storage: memoryStorage(),
+    send: async () => ({ result: "retry", reason: "offline" }),
+    now: at("2026-08-16T10:00:00Z"),
+    random: () => draws.shift() ?? 0.5,
+  });
+
+  await q.enqueue("note", {});
+  await q.enqueue("photo", {});
+  await q.flush();
+
+  const start = Date.parse("2026-08-16T10:00:00Z");
+  const delays = q.outstanding.map((o) => Date.parse(o.nextAttemptAt!) - start);
+  assert.deepEqual(delays, [500, 1000], "two changes that failed together do not return together");
+});
+
 test("an operation not yet due is left alone", async () => {
   const wire = transport({ note: { result: "retry", reason: "offline" } });
   const q = queue({ send: wire.send });
@@ -256,6 +277,31 @@ test("a rejected change is parked and does not block the rest", async () => {
   assert.equal(report.sent, 1, "the photo went through despite the note failing");
   assert.equal(q.failed.length, 1);
   assert.equal(q.failed[0]?.lastError, "title is required");
+  assert.equal(q.failed[0]?.parkedReason, "rejected");
+});
+
+// A row parked after a few failures must not also carry a next attempt: the
+// screen would promise a retry that is never coming.
+test("parking a rejection clears the delay it was waiting on", async () => {
+  const wire = transport({
+    note: [
+      { result: "retry", reason: "offline" },
+      { result: "rejected", reason: "title is required" },
+    ],
+  });
+  let clock = new Date("2026-08-16T10:00:00Z");
+  const q = queue({ send: wire.send, now: () => clock });
+
+  await q.enqueue("note", { title: "" });
+  await q.flush();
+  assert.ok(q.outstanding[0]?.nextAttemptAt, "it is waiting after the first failure");
+
+  clock = new Date("2026-08-16T10:05:00Z");
+  await q.flush();
+
+  assert.equal(q.failed[0]?.parkedReason, "rejected");
+  assert.equal(q.failed[0]?.nextAttemptAt, undefined, "a parked row is not also waiting");
+  assert.equal(q.failed[0]?.attempts, 2);
 });
 
 // A queue that reorders an edit and a delete applies them backwards.
@@ -271,10 +317,12 @@ test("order is kept within a kind while one is retrying", async () => {
   assert.deepEqual(wire.seen[0]?.payload, { text: "first" });
 });
 
+// A delay that doubles for ever is still a queue that never stops trying.
 test("an operation gives up after the attempt limit", async () => {
   const storage = memoryStorage();
   let clock = new Date("2026-08-16T10:00:00Z");
   const wire = transport({ note: { result: "retry", reason: "offline" } });
+  let last: FlushReport | undefined;
 
   for (let round = 0; round < 3; round++) {
     const q = new OfflineQueue({
@@ -286,14 +334,59 @@ test("an operation gives up after the attempt limit", async () => {
     });
     await q.load();
     if (round === 0) await q.enqueue("note", {});
-    await q.flush();
+    last = await q.flush();
     clock = new Date(clock.getTime() + 60 * 60 * 1000);
   }
+
+  assert.equal(last?.exhausted, 1, "giving up is not the same as being refused");
+  assert.equal(last?.rejected, 0);
 
   const final = new OfflineQueue({ storage, send: wire.send, now: () => clock, random: () => 0.5 });
   await final.load();
   assert.equal(final.failed.length, 1);
   assert.equal(final.failed[0]?.attempts, 3);
+  assert.equal(final.failed[0]?.parkedReason, "exhausted", "the screen can say which it was");
+  assert.equal(final.failed[0]?.lastError, "offline");
+  assert.equal(final.failed[0]?.nextAttemptAt, undefined, "a parked row is not also waiting");
+});
+
+// The exit from the parking lane: the user fixes the title, or the network
+// comes back, and the change goes round again under its original key.
+test("a parked change can be put back in the queue", async () => {
+  const wire = transport({
+    note: [{ result: "rejected", reason: "title is required" }, { result: "done" }],
+  });
+  const q = queue({ send: wire.send });
+  const enqueued = await q.enqueue("note", { title: "" });
+  await q.flush();
+  assert.equal(q.failed.length, 1);
+
+  await q.retry(enqueued.id);
+
+  assert.equal(q.failed.length, 0);
+  assert.equal(q.outstanding[0]?.state, "pending");
+  assert.equal(q.outstanding[0]?.attempts, 0, "the limit applies to the new run");
+  assert.equal(q.outstanding[0]?.parkedReason, undefined);
+
+  const report = await q.flush();
+  assert.equal(report.sent, 1);
+  assert.equal(
+    wire.seen[1]?.idempotencyKey,
+    wire.seen[0]?.idempotencyKey,
+    "the server still sees one change, not two",
+  );
+});
+
+test("only a parked change can be put back", async () => {
+  const wire = transport({ note: { result: "done" } });
+  const q = queue({ send: wire.send });
+  const enqueued = await q.enqueue("note", {});
+  await q.flush();
+
+  await q.retry(enqueued.id);
+
+  assert.equal(q.operations[0]?.state, "done", "an accepted change is not resurrected");
+  assert.equal(wire.seen.length, 1);
 });
 
 // A thrown transport error may still have reached the server, which is exactly

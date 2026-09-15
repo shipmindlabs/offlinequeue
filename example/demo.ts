@@ -51,6 +51,8 @@ console.log(`  arrived at the server: ${arrived.join(", ")}`);
 
 console.log("\nparked for the user to deal with:");
 for (const operation of restarted.failed) {
-  console.log(`  ${operation.kind}: ${operation.lastError} (after ${operation.attempts} attempt)`);
+  console.log(
+    `  ${operation.kind}: ${operation.lastError} (${operation.parkedReason} after ${operation.attempts} attempts)`,
+  );
 }
 console.log("\n  the rejected note did not hold up the good one behind it");

@@ -20,6 +20,13 @@
 
 export type OperationState = "pending" | "in-flight" | "failed" | "done";
 
+/**
+ * Why a parked operation stopped. The two need different words on screen and
+ * different actions from the user: a rejection wants the change edited or
+ * dropped, an exhausted one often only wants a better network.
+ */
+export type ParkedReason = "rejected" | "exhausted";
+
 export type Operation<T = unknown> = {
   readonly id: string;
   /** What kind of change this is. The caller's vocabulary, not this library's. */
@@ -35,6 +42,8 @@ export type Operation<T = unknown> = {
   readonly state: OperationState;
   /** Why it last failed, kept for the screen that shows the user. */
   readonly lastError?: string;
+  /** Set while the operation is parked, alongside the error that parked it. */
+  readonly parkedReason?: ParkedReason;
   /** Earliest time to try again, from the backoff. */
   readonly nextAttemptAt?: string;
   /**
@@ -89,7 +98,10 @@ export type QueueOptions = {
 
 export type FlushReport = {
   readonly sent: number;
+  /** Refused by the server, and parked for that reason. */
   readonly rejected: number;
+  /** Parked for running out of attempts rather than for being refused. */
+  readonly exhausted: number;
   readonly retrying: number;
   /** True when something is still waiting, whether now or after a delay. */
   readonly remaining: boolean;
@@ -123,7 +135,11 @@ export class OfflineQueue {
     return this.#operations.filter((o) => o.state !== "done");
   }
 
-  /** Operations parked for a person to deal with. */
+  /**
+   * Operations parked for a person to deal with, whether refused by the server
+   * or out of attempts. Each carries the error that stopped it and which of
+   * the two it was, which is the whole content of a "did not sync" screen.
+   */
   get failed(): readonly Operation[] {
     return this.#operations.filter((o) => o.state === "failed");
   }
@@ -198,6 +214,7 @@ export class OfflineQueue {
     const now = this.#options.now();
     let sent = 0;
     let rejected = 0;
+    let exhausted = 0;
     let retrying = 0;
     const blocked = new Set<string>();
 
@@ -225,6 +242,7 @@ export class OfflineQueue {
         this.#replace(operation.id, {
           state: "done",
           attempts: operation.attempts + 1,
+          nextAttemptAt: undefined,
           startedAt: undefined,
         });
         sent++;
@@ -234,25 +252,17 @@ export class OfflineQueue {
       if (outcome.result === "rejected") {
         // Parked, not retried: the server will never accept it, and holding the
         // rest of the queue behind it helps nobody.
-        this.#replace(operation.id, {
-          state: "failed",
-          attempts: operation.attempts + 1,
-          lastError: outcome.reason,
-          startedAt: undefined,
-        });
+        this.#park(operation, "rejected", outcome.reason);
         rejected++;
         continue;
       }
 
       const attempts = operation.attempts + 1;
       if (attempts >= this.#options.maxAttempts) {
-        this.#replace(operation.id, {
-          state: "failed",
-          attempts,
-          lastError: outcome.reason,
-          startedAt: undefined,
-        });
-        rejected++;
+        // The limit is the other end of the backoff: a delay that doubles for
+        // ever is still a queue that never stops trying.
+        this.#park({ ...operation, attempts }, "exhausted", outcome.reason);
+        exhausted++;
         continue;
       }
 
@@ -269,11 +279,11 @@ export class OfflineQueue {
     }
 
     await this.#persist();
-    return { sent, rejected, retrying, remaining: this.outstanding.length > 0 };
+    return { sent, rejected, exhausted, retrying, remaining: this.outstanding.length > 0 };
   }
 
   /**
-   * Exponential backoff with jitter.
+   * Exponential backoff with jitter, drawn afresh for each operation.
    *
    * The jitter is not decoration. Without it every phone that lost the same
    * cell tower retries at the same instant, and the server gets the outage back
@@ -283,6 +293,29 @@ export class OfflineQueue {
     const exponential = this.#options.baseDelayMs * 2 ** (attempts - 1);
     const capped = Math.min(exponential, this.#options.maxDelayMs);
     return Math.round(capped * (0.5 + this.#options.random() * 0.5));
+  }
+
+  /**
+   * Put a parked operation back in the queue: the user fixed what the server
+   * complained about, or an exhausted change deserves another run now that the
+   * network is back.
+   *
+   * The attempt count starts again, so the limit applies to the new run rather
+   * than being already spent. The idempotency key does not change, so a change
+   * the server did receive is still not applied twice.
+   */
+  async retry(id: string): Promise<void> {
+    await this.load();
+    const parked = this.#operations.find((operation) => operation.id === id);
+    if (!parked || parked.state !== "failed") return;
+    this.#replace(id, {
+      state: "pending",
+      attempts: 0,
+      parkedReason: undefined,
+      nextAttemptAt: undefined,
+      startedAt: undefined,
+    });
+    await this.#persist();
   }
 
   /** Drop a parked operation, e.g. after the user acknowledges it. */
@@ -297,6 +330,19 @@ export class OfflineQueue {
     await this.load();
     this.#operations = this.#operations.filter((operation) => operation.state !== "done");
     await this.#persist();
+  }
+
+  #park(operation: Operation, reason: ParkedReason, error: string): void {
+    this.#replace(operation.id, {
+      state: "failed",
+      attempts: operation.attempts + (reason === "rejected" ? 1 : 0),
+      lastError: error,
+      parkedReason: reason,
+      // A parked row that kept its next attempt would promise the screen a
+      // retry that is never coming.
+      nextAttemptAt: undefined,
+      startedAt: undefined,
+    });
   }
 
   #leaseExpired(operation: Operation, now: number): boolean {
@@ -323,11 +369,12 @@ export class OfflineQueue {
     this.#operations = this.#operations.map((operation): Operation => {
       if (operation.id !== id) return operation;
       const next = { ...operation, ...changes };
-      if (next.startedAt === undefined) {
-        // A stored `startedAt: undefined` is a key, and a key that survives the
-        // attempt would claim a lease over a row that is no longer in flight.
-        const { startedAt: ended, ...rest } = next;
-        return rest;
+      // A key set to undefined is still a key once stored: a surviving
+      // `startedAt` would claim a lease and a surviving `nextAttemptAt` a
+      // delay, over a row that has neither.
+      const fields = next as unknown as Record<string, unknown>;
+      for (const key of Object.keys(changes)) {
+        if (fields[key] === undefined) delete fields[key];
       }
       return next;
     });
