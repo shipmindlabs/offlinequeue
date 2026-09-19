@@ -11,11 +11,12 @@ $ npm run demo
 in a tunnel
   sent=0 retrying=2 rejected=0
   outstanding: 3
+  the second tap on save returned id-3, the row already queued
   next attempt in 750 ms
 
 the app is killed by the OS, and reopened five minutes later
   sent=2 retrying=0 rejected=1
-  arrived at the server: photo (id-2), note (id-6)
+  arrived at the server: photo (key-1), note (key-3)
 
 parked for the user to deal with:
   note: title is required (rejected after 2 attempts)
@@ -33,11 +34,13 @@ cell tower retries at the same instant and hands the outage back to the server
 as a thundering herd.
 
 **A timeout is retried and the server applies it twice.** Two identical charges.
-Every operation carries an `idempotencyKey` that survives restarts. An attempt
-also records when it started, so a change still in flight when the process died
-is recognised on the next start and returned to pending once its lease has run
-out — retried under the same key, and not while the first request may still be
-on the wire.
+Every change is given an `idempotencyKey` on the device when it is enqueued, and
+that key survives restarts and is sent with every attempt, so the server upserts
+instead of inserting. Enqueueing a key the queue already holds is a no-op, so a
+double tap on save queues one change rather than two. An attempt also records
+when it started, so a change still in flight when the process died is recognised
+on the next start and returned to pending once its lease has run out — retried
+under the same key, and not while the first request may still be on the wire.
 
 **One rejected change blocks everything.** A validation error retried for ever
 with the rest of the queue behind it. Here a rejection is parked for a person to
@@ -79,6 +82,26 @@ this, so retrying is pointless and blocking the queue behind it helps nobody.
 thing on demand; both are safe to call again, since a reclaim changes nothing
 the second time. Set `leaseMs` longer than the slowest request your transport
 will allow.
+
+## One change, one key
+
+`enqueue` generates the key unless you pass one, and it is generated here rather
+than asked for, because the server may never hear about the change at all. Pass
+your own when the change already has an identity on the device:
+
+```ts
+await queue.enqueue("note", { title, body }, `note:${draftId}`);
+```
+
+The queue then holds one row however many times the screen calls `enqueue` — a
+double tap, an effect that runs twice on a remount, a retried submit. A repeated
+key returns the row already queued rather than adding another, including one the
+server has already accepted. A parked row is returned the same way, which is why
+the ways out of the parking lane are `retry(id)` and `discard(id)` rather than
+enqueueing again.
+
+The key does not change when an attempt is retried or a parked change is put
+back, so a repeat on the wire is a repeat the server can recognise.
 
 ## The parking lane
 
@@ -132,8 +155,8 @@ exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, idempotency keys across restarts, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, per-kind ordering, prune |
-| Not yet | a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `flush` on connectivity change, encryption at rest |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, per-kind ordering, prune |
+| Not yet | editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `flush` on connectivity change, encryption at rest |
 
 ## Development
 

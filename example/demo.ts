@@ -1,6 +1,6 @@
 /**
  * A phone goes into a tunnel with three unsent changes, one of which the server
- * will never accept.
+ * will never accept — and a user who taps save twice.
  *
  *   npm run demo
  */
@@ -22,22 +22,37 @@ async function send(operation: Operation): Promise<Outcome> {
 const storage = memoryStorage();
 let clock = new Date("2026-08-16T10:00:00Z");
 const queue = () =>
-  new OfflineQueue({ storage, send, now: () => clock, random: () => 0.5, newId: nextId });
+  new OfflineQueue({
+    storage,
+    send,
+    now: () => clock,
+    random: () => 0.5,
+    newId: nextId,
+    newKey: nextKey,
+  });
 
-let counter = 0;
+let ids = 0;
 function nextId() {
-  return `id-${++counter}`;
+  return `id-${++ids}`;
+}
+
+let keys = 0;
+function nextKey() {
+  return `key-${++keys}`;
 }
 
 const offlineRun = queue();
 await offlineRun.enqueue("photo", { name: "beach.jpg" });
 await offlineRun.enqueue("note", { title: "" });
-await offlineRun.enqueue("note", { title: "Dinner" });
+const dinner = await offlineRun.enqueue("note", { title: "Dinner" });
+// Nothing happens on screen, so the user taps save a second time.
+const again = await offlineRun.enqueue("note", { title: "Dinner" }, dinner.idempotencyKey);
 
 console.log("in a tunnel");
 let report = await offlineRun.flush();
 console.log(`  sent=${report.sent} retrying=${report.retrying} rejected=${report.rejected}`);
 console.log(`  outstanding: ${offlineRun.outstanding.length}`);
+console.log(`  the second tap on save returned ${again.id}, the row already queued`);
 console.log(`  next attempt in ${offlineRun.delayFor(1)} ms`);
 
 console.log("\nthe app is killed by the OS, and reopened five minutes later");

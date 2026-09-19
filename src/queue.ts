@@ -33,8 +33,10 @@ export type Operation<T = unknown> = {
   readonly kind: string;
   readonly payload: T;
   /**
-   * Sent with the request so the server can recognise a repeat. Without this,
-   * a retried timeout becomes a duplicate charge.
+   * Given on the device when the change was recorded, and sent with every
+   * attempt so the server can upsert rather than insert. Without this, a
+   * retried timeout becomes a duplicate charge. It is also what the queue
+   * dedupes on: enqueueing this key again is a no-op.
    */
   readonly idempotencyKey: string;
   readonly createdAt: string;
@@ -94,6 +96,12 @@ export type QueueOptions = {
   /** Injectable so a test is not at the mercy of a random. */
   readonly random?: () => number;
   readonly newId?: () => string;
+  /**
+   * How a change gets its idempotency key when the caller supplies none.
+   * Injectable for tests, and for an app that already has a client id for the
+   * thing being changed.
+   */
+  readonly newKey?: () => string;
 };
 
 export type FlushReport = {
@@ -106,6 +114,21 @@ export type FlushReport = {
   /** True when something is still waiting, whether now or after a delay. */
   readonly remaining: boolean;
 };
+
+/**
+ * A key for one change on one device.
+ *
+ * A counter is wrong here even though it reads better: it restarts at one with
+ * the process, so a second run of the app would hand the server a key it has
+ * already seen, and the upsert would quietly drop a change that was not a
+ * repeat at all.
+ */
+function deviceKey(): string {
+  const source: { randomUUID?: () => string } | undefined = globalThis.crypto;
+  if (typeof source?.randomUUID === "function") return source.randomUUID();
+  const part = () => Math.random().toString(36).slice(2, 10);
+  return `${Date.now().toString(36)}-${part()}${part()}`;
+}
 
 export class OfflineQueue {
   #operations: Operation[] = [];
@@ -122,6 +145,7 @@ export class OfflineQueue {
       now: () => new Date(),
       random: Math.random,
       newId: () => `op-${++this.#counter}`,
+      newKey: deviceKey,
       ...options,
     };
   }
@@ -181,17 +205,29 @@ export class OfflineQueue {
   /**
    * Record a change. It is persisted before this resolves.
    *
+   * The change is given a key on the device unless the caller passes one, and
+   * enqueueing a key the queue already holds does nothing but hand back the row
+   * already there. So a key derived from what the user edited —
+   * `note:${draftId}` — makes a double tap on save, or an effect that runs
+   * twice on a remount, one change rather than two.
+   *
    * Loads first when the caller has not: persisting before loading would write
    * a one-element queue over everything that survived the last run, and a
    * forgotten load() must not be a way to lose a night's changes.
    */
   async enqueue<T>(kind: string, payload: T, idempotencyKey?: string): Promise<Operation<T>> {
     await this.load();
+    const key = idempotencyKey ?? this.#options.newKey();
+    // Accepted rows count too: one that reached the server is exactly the change
+    // that must not be queued a second time.
+    const existing = this.#operations.find((operation) => operation.idempotencyKey === key);
+    if (existing) return existing as Operation<T>;
+
     const operation: Operation<T> = {
       id: this.#options.newId(),
       kind,
       payload,
-      idempotencyKey: idempotencyKey ?? this.#options.newId(),
+      idempotencyKey: key,
       createdAt: this.#options.now().toISOString(),
       attempts: 0,
       state: "pending",

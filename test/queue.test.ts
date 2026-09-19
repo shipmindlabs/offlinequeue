@@ -123,6 +123,116 @@ test("enqueueing before load does not overwrite the stored queue", async () => {
   assert.equal(forgetful.outstanding.length, 2);
 });
 
+// The key is made on the device, so a counter that restarts with the process
+// would hand the server one key for two unrelated changes.
+test("every change gets a key of its own, across processes", async () => {
+  const storage = memoryStorage();
+  const first = queue({ storage, send: async () => ({ result: "retry", reason: "offline" }) });
+  const a = await first.enqueue("note", { text: "one" });
+  const b = await first.enqueue("note", { text: "two" });
+
+  const second = queue({ storage, send: async () => ({ result: "done" }) });
+  const c = await second.enqueue("note", { text: "three" });
+
+  const keys = new Set([a.idempotencyKey, b.idempotencyKey, c.idempotencyKey]);
+  assert.equal(keys.size, 3, "a restart must not reissue a key already spent");
+  for (const key of keys) assert.ok(key.length >= 8, "a key the server can tell apart");
+});
+
+// A double tap on save, or an effect that runs twice on a remount.
+test("enqueueing the same key twice is a no-op", async () => {
+  const storage = memoryStorage();
+  const wire = transport({ note: { result: "done" } });
+  const q = queue({ storage, send: wire.send });
+
+  const first = await q.enqueue("note", { title: "Dinner" }, "note:42");
+  const second = await q.enqueue("note", { title: "Dinner" }, "note:42");
+
+  assert.equal(second.id, first.id, "the row already queued is handed back");
+  assert.equal(q.outstanding.length, 1);
+  assert.deepEqual(
+    (await storage.load()).map((operation) => operation.payload),
+    [{ title: "Dinner" }],
+  );
+
+  await q.flush();
+  assert.equal(wire.seen.length, 1, "the server sees one change");
+});
+
+test("a repeated key changes nothing, so nothing is written", async () => {
+  const cells = memoryStorage();
+  let writes = 0;
+  const storage: Storage = {
+    load: () => cells.load(),
+    save: async (operations) => {
+      writes++;
+      await cells.save(operations);
+    },
+  };
+
+  const q = queue({ storage, send: async () => ({ result: "done" }) });
+  await q.enqueue("note", { title: "Dinner" }, "note:42");
+  assert.equal(writes, 1);
+
+  await q.enqueue("note", { title: "Dinner" }, "note:42");
+  assert.equal(writes, 1);
+});
+
+test("the dedupe survives the app being killed", async () => {
+  const storage = memoryStorage();
+  const first = queue({ storage, send: async () => ({ result: "retry", reason: "offline" }) });
+  await first.enqueue("note", { title: "Dinner" }, "note:42");
+
+  // A new process, and a screen that enqueues the same edit on mount.
+  const second = queue({ storage, send: async () => ({ result: "done" }) });
+  await second.enqueue("note", { title: "Dinner" }, "note:42");
+
+  assert.equal((await storage.load()).length, 1, "the change is not queued a second time");
+  assert.equal(second.outstanding.length, 1);
+});
+
+// The duplicate charge, arranged from the client side this time.
+test("a key the server already accepted is not queued again", async () => {
+  const wire = transport({ charge: { result: "done" } });
+  const q = queue({ send: wire.send });
+
+  await q.enqueue("charge", { amount: 100 }, "charge:42");
+  await q.flush();
+  await q.enqueue("charge", { amount: 100 }, "charge:42");
+  await q.flush();
+
+  assert.equal(wire.seen.length, 1, "the charge is not applied twice");
+  assert.equal(q.operations.length, 1);
+});
+
+// The ways out of the parking lane are retry() and discard(), not a second
+// enqueue that would quietly do nothing while looking like it worked.
+test("enqueueing a parked key hands back the parked row", async () => {
+  const wire = transport({ note: { result: "rejected", reason: "title is required" } });
+  const q = queue({ send: wire.send });
+  await q.enqueue("note", { title: "" }, "note:42");
+  await q.flush();
+
+  const again = await q.enqueue("note", { title: "Dinner" }, "note:42");
+
+  assert.equal(again.state, "failed");
+  assert.equal(again.lastError, "title is required");
+  assert.equal(q.operations.length, 1);
+});
+
+test("the key generator is injectable", async () => {
+  const q = new OfflineQueue({
+    storage: memoryStorage(),
+    send: async () => ({ result: "done" }),
+    now: at("2026-08-16T10:00:00Z"),
+    random: () => 0.5,
+    newKey: () => "from-the-app",
+  });
+
+  const operation = await q.enqueue("note", {});
+  assert.equal(operation.idempotencyKey, "from-the-app");
+});
+
 // An operation that was in flight when the process died has an unknown fate.
 // It must be retried, and the idempotency key is what makes that safe.
 test("an interrupted attempt is retried under the same idempotency key", async () => {
