@@ -80,6 +80,19 @@ export type Send = (operation: Operation) => Promise<Outcome>;
 export type QueueOptions = {
   readonly storage: Storage;
   readonly send: Send;
+  /**
+   * What a change touches — the thing its order is kept against. Two changes
+   * to one entity are sent in the order they were made; changes to different
+   * entities never wait for each other. Defaults to the kind, which orders a
+   * change against every other change of its kind.
+   */
+  readonly entityOf?: (operation: Operation) => string;
+  /**
+   * How many entities may be flushed at once. Because ordering is per entity,
+   * this limits unrelated changes in flight together and is never a way for two
+   * changes to one entity to overtake each other.
+   */
+  readonly concurrency?: number;
   /** First retry delay in milliseconds. Doubles each attempt. */
   readonly baseDelayMs?: number;
   /** Ceiling for the backoff, so a long outage does not push retries to hours. */
@@ -115,6 +128,9 @@ export type FlushReport = {
   readonly remaining: boolean;
 };
 
+/** The running count of one flush, filled in by the lanes as they go. */
+type Tally = { sent: number; rejected: number; exhausted: number; retrying: number };
+
 /**
  * A key for one change on one device.
  *
@@ -135,9 +151,12 @@ export class OfflineQueue {
   #options: Required<QueueOptions>;
   #loaded = false;
   #counter = 0;
+  #writing: Promise<void> = Promise.resolve();
 
   constructor(options: QueueOptions) {
     this.#options = {
+      entityOf: (operation) => operation.kind,
+      concurrency: 4,
       baseDelayMs: 1000,
       maxDelayMs: 5 * 60 * 1000,
       maxAttempts: 8,
@@ -238,84 +257,42 @@ export class OfflineQueue {
   }
 
   /**
-   * Try everything that is due, oldest first.
+   * Try everything that is due.
    *
-   * Order is preserved per kind: a queue that reorders an edit and a delete
-   * applies them backwards. Operations of different kinds do not block each
-   * other, so one stuck upload does not hold up a note.
+   * Changes to one entity are a lane: attempted oldest first, and the lane
+   * stops at the first one that has to be tried again, because a queue that
+   * reorders an edit and a delete applies them backwards. Lanes have no such
+   * relation to each other, so they run together — up to `concurrency` of them,
+   * which is what keeps one stuck upload from holding up anything but itself.
    */
   async flush(): Promise<FlushReport> {
     await this.load();
 
     const now = this.#options.now();
-    let sent = 0;
-    let rejected = 0;
-    let exhausted = 0;
-    let retrying = 0;
-    const blocked = new Set<string>();
+    const tally: Tally = { sent: 0, rejected: 0, exhausted: 0, retrying: 0 };
 
-    for (const operation of [...this.#operations]) {
+    const lanes = new Map<string, Operation[]>();
+    for (const operation of this.#operations) {
       if (operation.state === "done" || operation.state === "failed") continue;
-      if (blocked.has(operation.kind)) continue;
-      if (operation.state === "in-flight" && !this.#leaseExpired(operation, now.getTime())) {
-        // An attempt inside its lease is still out on the wire. Sending it
-        // again is the duplicate the whole idempotency story exists to avoid.
-        retrying++;
-        blocked.add(operation.kind);
-        continue;
-      }
-      if (operation.nextAttemptAt && new Date(operation.nextAttemptAt) > now) {
-        retrying++;
-        blocked.add(operation.kind);
-        continue;
-      }
-
-      this.#replace(operation.id, { state: "in-flight", startedAt: now.toISOString() });
-      await this.#persist();
-
-      const outcome = await this.#attempt(operation);
-      if (outcome.result === "done") {
-        this.#replace(operation.id, {
-          state: "done",
-          attempts: operation.attempts + 1,
-          nextAttemptAt: undefined,
-          startedAt: undefined,
-        });
-        sent++;
-        continue;
-      }
-
-      if (outcome.result === "rejected") {
-        // Parked, not retried: the server will never accept it, and holding the
-        // rest of the queue behind it helps nobody.
-        this.#park(operation, "rejected", outcome.reason);
-        rejected++;
-        continue;
-      }
-
-      const attempts = operation.attempts + 1;
-      if (attempts >= this.#options.maxAttempts) {
-        // The limit is the other end of the backoff: a delay that doubles for
-        // ever is still a queue that never stops trying.
-        this.#park({ ...operation, attempts }, "exhausted", outcome.reason);
-        exhausted++;
-        continue;
-      }
-
-      this.#replace(operation.id, {
-        state: "pending",
-        attempts,
-        lastError: outcome.reason,
-        nextAttemptAt: new Date(now.getTime() + this.delayFor(attempts)).toISOString(),
-        startedAt: undefined,
-      });
-      retrying++;
-      // Later operations of the same kind wait, so ordering survives.
-      blocked.add(operation.kind);
+      const entity = this.#options.entityOf(operation);
+      const waiting = lanes.get(entity);
+      if (waiting) waiting.push(operation);
+      else lanes.set(entity, [operation]);
     }
 
+    const due = [...lanes.values()];
+    let next = 0;
+    const workers = Math.max(1, Math.min(this.#options.concurrency, due.length));
+    await Promise.all(
+      Array.from({ length: workers }, async () => {
+        while (next < due.length) {
+          await this.#runLane(due[next++]!, now, tally);
+        }
+      }),
+    );
+
     await this.#persist();
-    return { sent, rejected, exhausted, retrying, remaining: this.outstanding.length > 0 };
+    return { ...tally, remaining: this.outstanding.length > 0 };
   }
 
   /**
@@ -368,6 +345,72 @@ export class OfflineQueue {
     await this.#persist();
   }
 
+  /**
+   * One entity's changes, in the order they were made.
+   *
+   * Nothing here overtakes anything else: the first change that has to wait —
+   * for its backoff, or because its attempt is still out on the wire — ends the
+   * lane for this flush. A parked change is the exception the parking lane
+   * exists for, and the lane carries on past it.
+   */
+  async #runLane(lane: readonly Operation[], now: Date, tally: Tally): Promise<void> {
+    for (const operation of lane) {
+      if (operation.state === "in-flight" && !this.#leaseExpired(operation, now.getTime())) {
+        // An attempt inside its lease is still out on the wire. Sending it
+        // again is the duplicate the whole idempotency story exists to avoid.
+        tally.retrying++;
+        return;
+      }
+      if (operation.nextAttemptAt && new Date(operation.nextAttemptAt) > now) {
+        tally.retrying++;
+        return;
+      }
+
+      this.#replace(operation.id, { state: "in-flight", startedAt: now.toISOString() });
+      await this.#persist();
+
+      const outcome = await this.#attempt(operation);
+      if (outcome.result === "done") {
+        this.#replace(operation.id, {
+          state: "done",
+          attempts: operation.attempts + 1,
+          nextAttemptAt: undefined,
+          startedAt: undefined,
+        });
+        tally.sent++;
+        continue;
+      }
+
+      if (outcome.result === "rejected") {
+        // Parked, not retried: the server will never accept it, and holding the
+        // rest of the entity's changes behind it helps nobody.
+        this.#park(operation, "rejected", outcome.reason);
+        tally.rejected++;
+        continue;
+      }
+
+      const attempts = operation.attempts + 1;
+      if (attempts >= this.#options.maxAttempts) {
+        // The limit is the other end of the backoff: a delay that doubles for
+        // ever is still a queue that never stops trying.
+        this.#park({ ...operation, attempts }, "exhausted", outcome.reason);
+        tally.exhausted++;
+        continue;
+      }
+
+      this.#replace(operation.id, {
+        state: "pending",
+        attempts,
+        lastError: outcome.reason,
+        nextAttemptAt: new Date(now.getTime() + this.delayFor(attempts)).toISOString(),
+        startedAt: undefined,
+      });
+      tally.retrying++;
+      // Later changes to this entity wait, so ordering survives.
+      return;
+    }
+  }
+
   #park(operation: Operation, reason: ParkedReason, error: string): void {
     this.#replace(operation.id, {
       state: "failed",
@@ -416,7 +459,19 @@ export class OfflineQueue {
     });
   }
 
-  async #persist(): Promise<void> {
-    await this.#options.storage.save(this.#operations);
+  /**
+   * Write the queue, one write at a time.
+   *
+   * Several lanes are in flight at once and each of them saves. Two stores
+   * overlapping would let an older snapshot land last and undo a change that
+   * had already been recorded, so the writes queue behind each other; each one
+   * takes the queue as it is when its turn comes.
+   */
+  #persist(): Promise<void> {
+    const written = this.#writing.then(() => this.#options.storage.save(this.#operations));
+    // The caller still hears about a failed write; the next one is not held
+    // behind a rejection it cannot do anything about.
+    this.#writing = written.catch(() => {});
+    return written;
   }
 }

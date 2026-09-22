@@ -115,6 +115,38 @@ There are two ways out. `discard(id)` drops it, and `retry(id)` puts it back in
 the queue with its attempt count reset — under the original idempotency key, so
 a change the server did receive is still not applied twice.
 
+## In order, but not one at a time
+
+Two changes to the same thing have to arrive in the order the user made them: a
+queue that reorders an edit and a delete applies them backwards. Two changes to
+different things have no such relation, and one stuck photo upload should not
+hold a note behind it.
+
+So order is kept per entity, and an entity is whatever your changes touch — you
+name it:
+
+```ts
+new OfflineQueue({
+  storage,
+  send,
+  entityOf: (operation) => (operation.payload as { noteId?: string }).noteId ?? operation.kind,
+  concurrency: 4,
+});
+```
+
+Changes to one entity are a lane: attempted oldest first, and the lane stops at
+the first change that has to be tried again rather than stepping over it. Lanes
+never wait for each other — `flush` runs up to `concurrency` of them at once,
+four by default, so a note goes out while a photo for another entity is still on
+the wire. Lower it to one for a server that dislikes parallel writes.
+
+A parked change is the exception parking exists for: its lane carries on past
+it, because nothing is coming for that row and holding the rest back helps
+nobody.
+
+`entityOf` defaults to the kind, so a queue that names no entity behaves as it
+always did — ordered within a kind, concurrent across kinds.
+
 ## Storage
 
 A change becomes a stored row before any network call, so the store is the one
@@ -128,7 +160,9 @@ memoryStorage()                // tests, and a first run before storage is wired
 ```
 
 A second argument names the key, because two queues in one app must not share
-one. Writing your own adapter is two methods, `load` and `save`.
+one. Writing your own adapter is two methods, `load` and `save`. A flush has
+several lanes in flight at once, and the queue serialises its writes so two of
+them never overlap: an adapter is only ever asked to save one thing at a time.
 
 ## No React Native import
 
@@ -140,11 +174,7 @@ needing a device.
 It also means the same queue runs in a web app, a worker, or a server-side test
 of your own sync logic.
 
-## Two smaller decisions
-
-**Order is kept within a kind, not globally.** A queue that reorders an edit and
-a delete applies them backwards. But one stuck photo upload should not hold up a
-note, so different kinds proceed independently.
+## One smaller decision
 
 **A store that cannot read starts empty; a store that cannot write throws.** An
 unreadable queue is bad and an app that will not start is worse — but swallowing
@@ -155,7 +185,7 @@ exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, per-kind ordering, prune |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, prune |
 | Not yet | editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `flush` on connectivity change, encryption at rest |
 
 ## Development
