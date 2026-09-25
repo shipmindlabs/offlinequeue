@@ -70,7 +70,7 @@ const queue = new OfflineQueue({
 await queue.load();
 await queue.enqueue("note", { title, body });
 
-// on reconnect, on foreground, on a timer
+// when the device can reach the server
 await queue.flush();
 ```
 
@@ -147,6 +147,49 @@ nobody.
 `entityOf` defaults to the kind, so a queue that names no entity behaves as it
 always did — ordered within a kind, concurrent across kinds.
 
+## On the network, not on a timer
+
+A flush is work for the moment the phone can reach the server, so it starts on a
+connectivity event and stops on the loss of one:
+
+```ts
+const stop = queue.start((listener) =>
+  NetInfo.addEventListener((state) => listener(Boolean(state.isInternetReachable))),
+);
+
+// on sign-out, or when the screen that owns the queue goes away
+stop();
+```
+
+There is no timer in here, and that is the point. A `setTimeout` set in the
+foreground does not survive the operating system suspending the app: it never
+fires, or it fires late in a batch at a moment nobody chose. So a backoff is a
+stored time rather than a pending callback, and it is read by the next flush —
+which the platform asks for, on reconnect or on foreground.
+
+Losing the connection cancels the flush in progress, rather than letting it walk
+the rest of the queue spending an attempt per change on requests that cannot
+arrive. The attempt already on the wire is finished and its outcome recorded,
+because walking away from it would leave a lease nobody closes and a row whose
+fate is unknown. Everything after it stays pending.
+
+Events arrive in bursts — coming out of a tunnel is several of them — and one
+flush per event would put the same queue on the wire twice, so a burst is one
+flush, then one more if something asked while it ran. A flush started from an
+event has no caller to throw to; pass a second argument to `start` to hear about
+a write that failed.
+
+`flush` takes a cancel token of your own for the same reasons — a sign-out, a
+screen that is going away:
+
+```ts
+const controller = new AbortController();
+await queue.flush({ signal: controller.signal });
+```
+
+An `AbortSignal` fits, and so does anything else with an `aborted` boolean.
+`queue.cancel()` does the same to the flush the queue started itself.
+
 ## Storage
 
 A change becomes a stored row before any network call, so the store is the one
@@ -166,10 +209,11 @@ them never overlap: an adapter is only ever asked to save one thing at a time.
 
 ## No React Native import
 
-Storage and transport arrive as functions. `AsyncStorage` fits `KeyValueStore`
-and MMKV fits `SyncKeyValueStore` without this package knowing either exists,
-which is why every behaviour above is tested in a plain test runner rather than
-needing a device.
+Storage, transport and connectivity arrive as functions. `AsyncStorage` fits
+`KeyValueStore`, MMKV fits `SyncKeyValueStore` and `NetInfo.addEventListener`
+fits `Connectivity` without this package knowing any of them exists, which is
+why every behaviour above is tested in a plain test runner rather than needing a
+device.
 
 It also means the same queue runs in a web app, a worker, or a server-side test
 of your own sync logic.
@@ -185,8 +229,8 @@ exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, prune |
-| Not yet | editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `flush` on connectivity change, encryption at rest |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
+| Not yet | editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
 
 ## Development
 

@@ -14,8 +14,8 @@
  *      validation failure retried for ever, with the rest of the queue behind it.
  *
  * This is the queue and the policy. It performs no network calls and touches no
- * React Native module: storage and transport arrive as functions, which is why
- * all of the above is testable in a plain test runner.
+ * React Native module: storage, transport and connectivity arrive as functions,
+ * which is why all of the above is testable in a plain test runner.
  */
 
 export type OperationState = "pending" | "in-flight" | "failed" | "done";
@@ -76,6 +76,27 @@ export type Outcome =
   | { readonly result: "retry"; readonly reason: string };
 
 export type Send = (operation: Operation) => Promise<Outcome>;
+
+/**
+ * Something a caller can flip to stop a flush. An `AbortSignal` is one of
+ * these, and so is `{ aborted: true }`.
+ */
+export type CancelToken = { readonly aborted: boolean };
+
+/** Undo a subscription. */
+export type Unsubscribe = () => void;
+
+/**
+ * A source of connectivity events: hand it a listener, get back the way to stop
+ * listening. `NetInfo.addEventListener` is one of these once its state object
+ * is reduced to a boolean.
+ */
+export type Connectivity = (listener: (online: boolean) => void) => Unsubscribe;
+
+export type FlushOptions = {
+  /** Stops the flush between attempts. */
+  readonly signal?: CancelToken;
+};
 
 export type QueueOptions = {
   readonly storage: Storage;
@@ -152,6 +173,10 @@ export class OfflineQueue {
   #loaded = false;
   #counter = 0;
   #writing: Promise<void> = Promise.resolve();
+  #unsubscribe: Unsubscribe | undefined;
+  #token: { aborted: boolean } | undefined;
+  #running = false;
+  #again = false;
 
   constructor(options: QueueOptions) {
     this.#options = {
@@ -257,6 +282,51 @@ export class OfflineQueue {
   }
 
   /**
+   * Flush while the device is online, and stop when it is not.
+   *
+   * Nothing is scheduled here, because a timer set in the foreground does not
+   * survive the operating system suspending the app: it never fires, or it
+   * fires late in a batch at a moment nobody chose. Work starts on an event
+   * from the platform instead, and a backoff is a stored time rather than a
+   * pending callback, so it is still in force after the process that set it is
+   * gone.
+   *
+   * Most platform sources report the current state on subscribe, which is what
+   * starts the first flush.
+   */
+  start(connectivity: Connectivity, onError?: (error: unknown) => void): Unsubscribe {
+    this.stop();
+    this.#unsubscribe = connectivity((online) => {
+      if (!online) {
+        this.cancel();
+        return;
+      }
+      // A flush that starts from an event has no caller to throw to, so a write
+      // that failed goes to onError or nowhere.
+      this.#run().catch((error: unknown) => onError?.(error));
+    });
+    return () => this.stop();
+  }
+
+  /** Stop listening for connectivity, and cancel a flush that is running. */
+  stop(): void {
+    this.#unsubscribe?.();
+    this.#unsubscribe = undefined;
+    this.cancel();
+  }
+
+  /**
+   * Ask the running flush to stop once the attempt now on the wire has ended.
+   *
+   * That attempt is not abandoned: walking away from it would leave a lease
+   * nobody closes and an outcome nobody recorded — a row whose fate is unknown
+   * until the lease runs out.
+   */
+  cancel(): void {
+    if (this.#token) this.#token.aborted = true;
+  }
+
+  /**
    * Try everything that is due.
    *
    * Changes to one entity are a lane: attempted oldest first, and the lane
@@ -264,10 +334,14 @@ export class OfflineQueue {
    * reorders an edit and a delete applies them backwards. Lanes have no such
    * relation to each other, so they run together — up to `concurrency` of them,
    * which is what keeps one stuck upload from holding up anything but itself.
+   *
+   * A cancelled flush stops between attempts and leaves everything it did not
+   * reach pending, for the next connection.
    */
-  async flush(): Promise<FlushReport> {
+  async flush(options: FlushOptions = {}): Promise<FlushReport> {
     await this.load();
 
+    const signal = options.signal;
     const now = this.#options.now();
     const tally: Tally = { sent: 0, rejected: 0, exhausted: 0, retrying: 0 };
 
@@ -286,7 +360,8 @@ export class OfflineQueue {
     await Promise.all(
       Array.from({ length: workers }, async () => {
         while (next < due.length) {
-          await this.#runLane(due[next++]!, now, tally);
+          if (signal?.aborted) return;
+          await this.#runLane(due[next++]!, now, tally, signal);
         }
       }),
     );
@@ -346,6 +421,35 @@ export class OfflineQueue {
   }
 
   /**
+   * One flush at a time, and one more afterwards if the platform spoke while it
+   * ran.
+   *
+   * Connectivity events arrive in bursts — coming out of a tunnel is several of
+   * them — and a flush per event would put one queue on the wire twice over.
+   */
+  async #run(): Promise<void> {
+    if (this.#running) {
+      this.#again = true;
+      return;
+    }
+    this.#running = true;
+    try {
+      do {
+        this.#again = false;
+        const token = { aborted: false };
+        this.#token = token;
+        try {
+          await this.flush({ signal: token });
+        } finally {
+          this.#token = undefined;
+        }
+      } while (this.#again);
+    } finally {
+      this.#running = false;
+    }
+  }
+
+  /**
    * One entity's changes, in the order they were made.
    *
    * Nothing here overtakes anything else: the first change that has to wait —
@@ -353,8 +457,16 @@ export class OfflineQueue {
    * lane for this flush. A parked change is the exception the parking lane
    * exists for, and the lane carries on past it.
    */
-  async #runLane(lane: readonly Operation[], now: Date, tally: Tally): Promise<void> {
+  async #runLane(
+    lane: readonly Operation[],
+    now: Date,
+    tally: Tally,
+    signal?: CancelToken,
+  ): Promise<void> {
     for (const operation of lane) {
+      // Between attempts is the only place a flush can stop: the connection is
+      // gone, and the rest of the lane would spend its attempts on failures.
+      if (signal?.aborted) return;
       if (operation.state === "in-flight" && !this.#leaseExpired(operation, now.getTime())) {
         // An attempt inside its lease is still out on the wire. Sending it
         // again is the duplicate the whole idempotency story exists to avoid.

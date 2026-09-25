@@ -5,6 +5,9 @@
 
 export {
   OfflineQueue,
+  type CancelToken,
+  type Connectivity,
+  type FlushOptions,
   type FlushReport,
   type Operation,
   type OperationState,
@@ -13,6 +16,7 @@ export {
   type QueueOptions,
   type Send,
   type Storage,
+  type Unsubscribe,
 } from "./queue.ts";
 
 export {
