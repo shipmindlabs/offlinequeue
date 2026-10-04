@@ -83,6 +83,114 @@ thing on demand; both are safe to call again, since a reclaim changes nothing
 the second time. Set `leaseMs` longer than the slowest request your transport
 will allow.
 
+## The six states of a change
+
+`state` holds four values, and two of them split in two: six states a screen can
+tell apart, and no others. The split is the part worth knowing — a change that
+is waiting on a backoff and one that is due need different words, and a refused
+change and an exhausted one need different buttons.
+
+```
+  enqueue   persisted before it resolves        ──►  pending
+
+  pending   the flush reaches it                ──►  in-flight
+
+  in-flight outcome done                        ──►  done
+  in-flight outcome retry, attempts left        ──►  waiting
+  in-flight outcome retry, attempts spent       ──►  exhausted   (parked)
+  in-flight outcome rejected                    ──►  rejected    (parked)
+  in-flight lease run out, recover()            ──►  pending
+
+  waiting   its stored time passes              ──►  pending
+
+  rejected  retry(id)                           ──►  pending
+  exhausted retry(id)                           ──►  pending
+  rejected  discard(id)                         ──►  gone
+  exhausted discard(id)                         ──►  gone
+  done      prune()                             ──►  gone
+```
+
+`gone` is not a state; it is the row no longer being in storage.
+
+| Name | How it is stored | What it is |
+|---|---|---|
+| pending | `pending`, nothing in `nextAttemptAt` that is still ahead | due: the next flush attempts it |
+| waiting | `pending`, with `nextAttemptAt` in the future | its backoff has not elapsed |
+| in-flight | `in-flight`, with `startedAt` | an attempt is on the wire — or died with the process that started it |
+| rejected | `failed`, `parkedReason: "rejected"` | the server will never accept it; a person decides |
+| exhausted | `failed`, `parkedReason: "exhausted"` | out of `maxAttempts`; a better network may be all it needs |
+| done | `done` | accepted, and kept until `prune()` |
+
+`queue.outstanding` is the five that are not `done`, which is what a "pending
+changes" badge counts. `queue.failed` is the two parked ones.
+
+**Into the queue.** `enqueue` writes the row before it resolves, so the change
+is on the device before any request exists. Repeating an idempotency key is not
+a transition at all: `enqueue` hands back whichever row holds that key, in
+whatever state it is in — including `done` and both parked ones.
+
+**pending → in-flight.** The flush takes a lane's oldest change first, sets
+`startedAt`, and stores the row before the request leaves. A row that still
+looked untried while its request was out is exactly how a crash becomes a
+duplicate charge.
+
+**in-flight → done, waiting, rejected or exhausted.** The outcome your `send`
+returns decides which, and `maxAttempts` decides between the last two. A row
+leaving `in-flight` always loses its `startedAt`, so the lease ends with the
+attempt; `done` and both parked states carry no `nextAttemptAt`, because nothing
+is coming for them. A rejection parks the change and the rest of its lane
+carries on; a retry stops the lane, so later changes to the same entity are not
+attempted ahead of it.
+
+**waiting → pending.** By time passing, and by nothing else. `nextAttemptAt` is
+a stored time read by the next flush rather than a scheduled callback, so a
+backoff set before the operating system suspended the app is still in force when
+the app comes back, and a restart is not a way around it.
+
+**in-flight → pending.** Only once the lease has run out, and only through
+`load()` or `recover()`. Inside the lease the attempt is assumed to still be
+running, and the lane stops rather than sending a second copy. `attempts` does
+not go up: an attempt whose outcome nobody recorded is not spent, so being
+killed mid-request never parks a change. A row in flight with no `startedAt` has
+an unknown age, and is reclaimed on sight.
+
+**rejected or exhausted → pending.** `retry(id)` only, with `attempts` back to
+zero and `parkedReason` cleared, under the original idempotency key. `discard(id)`
+is the other way out. Nothing else moves a parked row — and nothing moves a
+`done` one, whose only remaining event is `prune()`.
+
+**A cancelled flush moves nothing** beyond the attempt already on the wire,
+whose outcome is recorded as usual. Everything it did not reach stays `pending`,
+including the rest of the lane it stopped in.
+
+### What it refuses to do
+
+**No CRDT, no conflict resolution, no merge.** A payload is bytes this queue
+stores and sends unchanged. There is no vector clock, no operational transform,
+no last-writer-wins rule over two versions of a note — because the queue sees
+one device and a conflict needs two. Which version wins is the server's
+decision, and the queue's job is to deliver the change in order, with a key the
+server can recognise.
+
+**It does not decide what a `409` means.** Your `send` does: `rejected` parks it
+for a person, `retry` tries again under the same key. Only the application knows
+whether the server's version can be reconciled, so the library refuses to guess.
+A hook for that answer is on the list below, not in here.
+
+**It does not rewrite or combine changes.** Two edits to one note are two
+requests, in the order the user made them; they are never collapsed into one, and
+a parked change carries exactly the payload that was enqueued. A screen that
+wants one row rather than a history should enqueue under a key derived from the
+draft — see below.
+
+**It does not promise exactly-once.** It promises at-least-once on the wire and
+a stable key on every attempt. Applying that key once is the server's half of
+the bargain, and no client can keep it alone.
+
+**It does not order changes to different entities.** Two lanes have no relation,
+so nothing says which of them reaches the server first. If two changes must
+arrive in order, they must name the same entity.
+
 ## One change, one key
 
 `enqueue` generates the key unless you pass one, and it is generated here rather
