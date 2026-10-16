@@ -36,29 +36,37 @@ const defaultKey = "offlinequeue";
  * Anything that is not an array of operations is not a queue. A store holding
  * something else — a key collision, a half-written value — reads as empty
  * rather than as a queue of nonsense.
+ *
+ * A store that could not answer at all is a different failure and is not
+ * handled here: it has said nothing about what the device holds, so it is not
+ * turned into an empty queue.
  */
 function decode(raw: string | null | undefined): Operation[] {
   if (!raw) return [];
-  const parsed: unknown = JSON.parse(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
   return Array.isArray(parsed) ? (parsed as Operation[]) : [];
 }
 
 /**
  * Keep the queue in an asynchronous key-value store, under one key.
  *
- * A store that fails to read is treated as empty rather than fatal: an
- * unreadable queue is bad, but an app that will not start is worse. A store
- * that fails to write is not swallowed — that would lose a change silently,
- * which is the exact failure this library exists to prevent.
+ * A value that is not a queue reads as empty: a key collision or a half-written
+ * value is bad, but an app that will not start is worse. A store that cannot be
+ * read at all is the other case, and that failure travels — a read that failed
+ * is not knowledge that the device holds nothing, and the queue must not write
+ * over what it never saw. A failed write is not swallowed either: that would
+ * lose a change silently, which is the exact failure this library exists to
+ * prevent.
  */
 export function keyValueStorage(store: KeyValueStore, key = defaultKey): Storage {
   return {
     async load() {
-      try {
-        return decode(await store.getItem(key));
-      } catch {
-        return [];
-      }
+      return decode(await store.getItem(key));
     },
     async save(operations) {
       await store.setItem(key, JSON.stringify(operations));
@@ -77,11 +85,7 @@ export function keyValueStorage(store: KeyValueStore, key = defaultKey): Storage
 export function mmkvStorage(store: SyncKeyValueStore, key = defaultKey): Storage {
   return {
     async load() {
-      try {
-        return decode(store.getString(key));
-      } catch {
-        return [];
-      }
+      return decode(store.getString(key));
     },
     async save(operations) {
       store.set(key, JSON.stringify(operations));
