@@ -81,7 +81,9 @@ this, so retrying is pointless and blocking the queue behind it helps nobody.
 `load` reclaims abandoned attempts on the way in, and `recover` does the same
 thing on demand; both are safe to call again, since a reclaim changes nothing
 the second time. Set `leaseMs` longer than the slowest request your transport
-will allow.
+will allow. A read that fails is not an empty queue: `load` rethrows and the
+queue stays unloaded, so `enqueue`, `recover` and `flush` read again rather than
+writing over changes nobody managed to see.
 
 ## The six states of a change
 
@@ -285,7 +287,7 @@ Events arrive in bursts — coming out of a tunnel is several of them — and on
 flush per event would put the same queue on the wire twice, so a burst is one
 flush, then one more if something asked while it ran. A flush started from an
 event has no caller to throw to; pass a second argument to `start` to hear about
-a write that failed.
+a read or a write that failed.
 
 `flush` takes a cancel token of your own for the same reasons — a sign-out, a
 screen that is going away:
@@ -314,6 +316,9 @@ A second argument names the key, because two queues in one app must not share
 one. Writing your own adapter is two methods, `load` and `save`. A flush has
 several lanes in flight at once, and the queue serialises its writes so two of
 them never overlap: an adapter is only ever asked to save one thing at a time.
+It is asked to load one thing at a time too — however many callers find the
+queue unloaded, they wait on one read, because a second read settling on top of
+the first would drop whatever was enqueued in between.
 
 ## No React Native import
 
@@ -326,18 +331,24 @@ device.
 It also means the same queue runs in a web app, a worker, or a server-side test
 of your own sync logic.
 
-## One smaller decision
+## Two smaller decisions
 
-**A store that cannot read starts empty; a store that cannot write throws.** An
-unreadable queue is bad and an app that will not start is worse — but swallowing
-a write failure would lose a change silently, which is the exact thing this
-exists to prevent.
+**A value that is not a queue reads as empty; a store that could not answer does
+not.** A key collision or a half-written value is bad and an app that will not
+start is worse, so a value that cannot be decoded reads as an empty queue. A
+read that *failed* is different: it has said nothing about what the device
+holds, so the failure travels and the queue refuses to write until a read
+succeeds. One transient failure plus one `enqueue` must not be how a night's
+changes are written over.
+
+**A store that cannot write throws.** Swallowing a write failure would lose a
+change silently, which is the exact thing this exists to prevent.
 
 ## Status
 
 | | |
 |---|---|
-| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
 | Not yet | editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
 
 ## Development

@@ -171,6 +171,7 @@ export class OfflineQueue {
   #operations: Operation[] = [];
   #options: Required<QueueOptions>;
   #loaded = false;
+  #loading: Promise<void> | undefined;
   #counter = 0;
   #writing: Promise<void> = Promise.resolve();
   #unsubscribe: Unsubscribe | undefined;
@@ -212,9 +213,30 @@ export class OfflineQueue {
     return this.#operations.filter((o) => o.state === "failed");
   }
 
-  /** Read what survived the app being killed, and reclaim what it interrupted. */
+  /**
+   * Read what survived the app being killed, and reclaim what it interrupted.
+   *
+   * A read that failed is not knowledge that the device holds nothing, so the
+   * failure travels and the queue stays unloaded: `enqueue`, `recover` and
+   * `flush` read again rather than writing a fresh queue over changes nobody
+   * managed to see.
+   *
+   * One read answers every caller that arrives before it lands, because a
+   * second read settling on top of the first would drop whatever was enqueued
+   * in between.
+   */
   async load(): Promise<void> {
     if (this.#loaded) return;
+    const reading = (this.#loading ??= this.#read());
+    try {
+      await reading;
+    } finally {
+      // A failed read leaves nothing to keep, so the next caller tries again.
+      if (!this.#loaded && this.#loading === reading) this.#loading = undefined;
+    }
+  }
+
+  async #read(): Promise<void> {
     this.#operations = await this.#options.storage.load();
     this.#loaded = true;
     await this.recover();
@@ -257,7 +279,8 @@ export class OfflineQueue {
    *
    * Loads first when the caller has not: persisting before loading would write
    * a one-element queue over everything that survived the last run, and a
-   * forgotten load() must not be a way to lose a night's changes.
+   * forgotten load() must not be a way to lose a night's changes. A read that
+   * failed stops the write for the same reason.
    */
   async enqueue<T>(kind: string, payload: T, idempotencyKey?: string): Promise<Operation<T>> {
     await this.load();
@@ -301,8 +324,8 @@ export class OfflineQueue {
         this.cancel();
         return;
       }
-      // A flush that starts from an event has no caller to throw to, so a write
-      // that failed goes to onError or nowhere.
+      // A flush that starts from an event has no caller to throw to, so a read
+      // or write that failed goes to onError or nowhere.
       this.#run().catch((error: unknown) => onError?.(error));
     });
     return () => this.stop();

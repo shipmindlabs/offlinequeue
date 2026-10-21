@@ -6,6 +6,9 @@
  * and every change that survived the night is written over. So the failure
  * travels, the queue stays unloaded, and `enqueue`, `recover` and `flush` read
  * again rather than writing over a queue nobody managed to see.
+ *
+ * One read answers every caller waiting on it, because a second read settling
+ * on top of the first loses whatever was enqueued in between.
  */
 
 import { test } from "node:test";
@@ -125,6 +128,45 @@ test("recovery over a failed read leaves the interrupted row alone", async () =>
   await q.recover();
   assert.equal(q.outstanding[0]?.state, "pending", "the second read reclaims it");
   assert.equal((await cells.load())[0]?.state, "pending");
+});
+
+// Two callers on one unloaded queue is a screen enqueueing while a reconnect
+// flushes. They wait on one read, so one failure is one failure.
+test("callers waiting on the same failed read all hear about it", async () => {
+  const cells = memoryStorage();
+  const overnight = queue(cells, offline);
+  await overnight.enqueue("note", { text: "survived the night" });
+
+  const q = queue(throwsOnceOnRead(cells), accepted);
+  const outcomes = await Promise.allSettled([q.enqueue("note", { text: "fresh" }), q.flush()]);
+
+  assert.deepEqual(
+    outcomes.map((outcome) => outcome.status),
+    ["rejected", "rejected"],
+    "neither of them read an empty queue out of the failure",
+  );
+  assert.equal((await cells.load()).length, 1, "and nothing was written");
+
+  await q.enqueue("note", { text: "fresh" });
+  assert.equal((await cells.load()).length, 2, "the next caller reads again");
+});
+
+// A second read landing on top of the first is the same loss by another route:
+// the row enqueued in between is not in the snapshot the later read returns.
+test("two changes enqueued before the first read lands are both kept", async () => {
+  const cells = memoryStorage();
+  const overnight = queue(cells, offline);
+  await overnight.enqueue("note", { text: "survived the night" });
+
+  const q = queue(cells, accepted);
+  const [first, second] = await Promise.all([
+    q.enqueue("note", { text: "one" }),
+    q.enqueue("note", { text: "two" }),
+  ]);
+
+  assert.notEqual(first.id, second.id);
+  assert.equal(q.operations.length, 3);
+  assert.equal((await cells.load()).length, 3, "neither change was read over by the other");
 });
 
 // A flush started from a connectivity event has no caller to throw to, and a
