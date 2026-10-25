@@ -313,12 +313,15 @@ memoryStorage()                // tests, and a first run before storage is wired
 ```
 
 A second argument names the key, because two queues in one app must not share
-one. Writing your own adapter is two methods, `load` and `save`. A flush has
-several lanes in flight at once, and the queue serialises its writes so two of
-them never overlap: an adapter is only ever asked to save one thing at a time.
-It is asked to load one thing at a time too — however many callers find the
-queue unloaded, they wait on one read, because a second read settling on top of
-the first would drop whatever was enqueued in between.
+one. Writing your own adapter is two methods, `load` and `save`. Throw from
+`load` when the store cannot answer, rather than returning `[]`: an empty array
+is a claim that the device holds nothing, and the queue believes it and writes
+over whatever was there. A flush has several lanes in flight at once, and the
+queue serialises its writes so two of them never overlap: an adapter is only
+ever asked to save one thing at a time. It is asked to load one thing at a time
+too — however many callers find the queue unloaded, they wait on one read,
+because a second read settling on top of the first would drop whatever was
+enqueued in between.
 
 ## No React Native import
 
@@ -331,25 +334,31 @@ device.
 It also means the same queue runs in a web app, a worker, or a server-side test
 of your own sync logic.
 
-## Two smaller decisions
+## Three smaller decisions
 
-**A value that is not a queue reads as empty; a store that could not answer does
-not.** A key collision or a half-written value is bad and an app that will not
-start is worse, so a value that cannot be decoded reads as an empty queue. A
-read that *failed* is different: it has said nothing about what the device
-holds, so the failure travels and the queue refuses to write until a read
+Three things can go wrong around the store, and they are three different
+failures with three different answers.
+
+**A read that failed is not an empty queue.** It has said nothing about what the
+device holds, so the failure travels: `load` rethrows, the queue stays unloaded,
+and `enqueue`, `flush` and `recover` reject rather than write until a later read
 succeeds. One transient failure plus one `enqueue` must not be how a night's
 changes are written over.
 
-**A store that cannot write throws.** Swallowing a write failure would lose a
-change silently, which is the exact thing this exists to prevent.
+**A value that is not a queue reads as empty.** A key collision or a
+half-written value is bad, and an app that will not start is worse, so a value
+that cannot be decoded is not passed on as a failure — the queue starts empty
+and the next write replaces it.
+
+**A write that failed throws.** Swallowing it would lose a change silently,
+which is the exact thing this exists to prevent.
 
 ## Status
 
 | | |
 |---|---|
-| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
-| Not yet | editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, a stored value that is not a queue read as an empty one, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
+| Not yet | keeping a value that is not a queue aside instead of discarding it, editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
 
 ## Development
 
