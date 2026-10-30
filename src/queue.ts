@@ -407,13 +407,15 @@ export class OfflineQueue {
   }
 
   /**
-   * Put a parked operation back in the queue: the user fixed what the server
-   * complained about, or an exhausted change deserves another run now that the
-   * network is back.
+   * Put a parked operation back in the queue under the key it already carries:
+   * an exhausted change deserves another run now that the network is back, or
+   * the server's complaint was about something other than the payload.
    *
    * The attempt count starts again, so the limit applies to the new run rather
    * than being already spent. The idempotency key does not change, so a change
-   * the server did receive is still not applied twice.
+   * the server did receive is still not applied twice — which is also why this
+   * cannot carry a new payload: the key names a request the server has already
+   * answered. That move is `amend`.
    */
   async retry(id: string): Promise<void> {
     await this.load();
@@ -427,6 +429,46 @@ export class OfflineQueue {
       startedAt: undefined,
     });
     await this.#persist();
+  }
+
+  /**
+   * Amend a rejected change: the same row, a new payload, a new key.
+   *
+   * The key is new because a key names one exact request. A server that
+   * remembers keys answers the old one, so the corrected payload sent under the
+   * old key is a fix that never lands. The attempts start again and the error
+   * goes with the payload it described.
+   *
+   * Only a rejection qualifies. An exhausted change ran out of attempts without
+   * ever getting an answer, so nobody knows whether the server applied it, and
+   * a new key is precisely how it would be applied a second time: that one is
+   * refused rather than quietly amended.
+   */
+  async amend<T>(id: string, payload: T): Promise<Operation<T>> {
+    await this.load();
+    const parked = this.#operations.find((operation) => operation.id === id);
+    if (!parked || parked.state !== "failed") {
+      throw new Error(`amend: ${id} is not a parked change`);
+    }
+    if (parked.parkedReason === "exhausted") {
+      throw new Error(
+        `amend: ${id} is exhausted rather than rejected — the server may have applied it, ` +
+          `and a new key is how it would be applied twice; retry or discard it instead`,
+      );
+    }
+    this.#replace(id, {
+      payload,
+      idempotencyKey: this.#options.newKey(),
+      state: "pending",
+      attempts: 0,
+      lastError: undefined,
+      parkedReason: undefined,
+      nextAttemptAt: undefined,
+      startedAt: undefined,
+    });
+    const amended = this.#operations.find((operation) => operation.id === id)!;
+    await this.#persist();
+    return amended as Operation<T>;
   }
 
   /** Drop a parked operation, e.g. after the user acknowledges it. */

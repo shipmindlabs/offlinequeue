@@ -107,6 +107,7 @@ change and an exhausted one need different buttons.
 
   rejected  retry(id)                           ──►  pending
   exhausted retry(id)                           ──►  pending
+  rejected  amend(id, payload)                  ──►  pending, under a new key
   rejected  discard(id)                         ──►  gone
   exhausted discard(id)                         ──►  gone
   done      prune()                             ──►  gone
@@ -156,10 +157,14 @@ not go up: an attempt whose outcome nobody recorded is not spent, so being
 killed mid-request never parks a change. A row in flight with no `startedAt` has
 an unknown age, and is reclaimed on sight.
 
-**rejected or exhausted → pending.** `retry(id)` only, with `attempts` back to
-zero and `parkedReason` cleared, under the original idempotency key. `discard(id)`
-is the other way out. Nothing else moves a parked row — and nothing moves a
-`done` one, whose only remaining event is `prune()`.
+**rejected or exhausted → pending.** `retry(id)`, with `attempts` back to zero
+and `parkedReason` cleared, under the original idempotency key.
+`amend(id, payload)` is the same move for a rejection the user has fixed, and it
+is the one transition that changes the key, because a different payload is a
+different request. An exhausted row cannot be amended: its request may have been
+applied, and a new key would be how it is applied twice. `discard(id)` is the
+other way out. Nothing else moves a parked row — and nothing moves a `done` one,
+whose only remaining event is `prune()`.
 
 **A cancelled flush moves nothing** beyond the attempt already on the wire,
 whose outcome is recorded as usual. Everything it did not reach stays `pending`,
@@ -181,9 +186,9 @@ A hook for that answer is on the list below, not in here.
 
 **It does not rewrite or combine changes.** Two edits to one note are two
 requests, in the order the user made them; they are never collapsed into one, and
-a parked change carries exactly the payload that was enqueued. A screen that
-wants one row rather than a history should enqueue under a key derived from the
-draft — see below.
+a parked change carries exactly the payload that was enqueued until the app
+replaces it with `amend`. A screen that wants one row rather than a history
+should enqueue under a key derived from the draft — see below.
 
 **It does not promise exactly-once.** It promises at-least-once on the wire and
 a stable key on every attempt. Applying that key once is the server's half of
@@ -207,11 +212,13 @@ The queue then holds one row however many times the screen calls `enqueue` — a
 double tap, an effect that runs twice on a remount, a retried submit. A repeated
 key returns the row already queued rather than adding another, including one the
 server has already accepted. A parked row is returned the same way, which is why
-the ways out of the parking lane are `retry(id)` and `discard(id)` rather than
-enqueueing again.
+the ways out of the parking lane are `retry(id)`, `amend(id, payload)` and
+`discard(id)` rather than enqueueing again.
 
 The key does not change when an attempt is retried or a parked change is put
-back, so a repeat on the wire is a repeat the server can recognise.
+back by `retry(id)`, so a repeat on the wire is a repeat the server can
+recognise. The one thing that changes it is `amend`, which sends a payload the
+server has not seen — a different request, which has to carry a different key.
 
 ## The parking lane
 
@@ -221,9 +228,26 @@ says which of the two things happened in `parkedReason`: `rejected` needs a
 person, `exhausted` ran out of `maxAttempts` and may only need a better network.
 A parked row carries no `nextAttemptAt`, because nothing is coming.
 
-There are two ways out. `discard(id)` drops it, and `retry(id)` puts it back in
+There are three ways out. `discard(id)` drops it. `retry(id)` puts it back in
 the queue with its attempt count reset — under the original idempotency key, so
-a change the server did receive is still not applied twice.
+a change the server did receive is still not applied twice. And
+`amend(id, payload)` puts it back with a payload the user corrected:
+
+```ts
+await queue.amend(rejected.id, { title: "Dinner", body });
+```
+
+That one is also the only place a key changes. A key names one exact request,
+and a server that remembers keys answers the old one: a corrected title sent
+under the refused key is a fix that never lands. So `amend` draws a fresh key,
+puts the attempts back to zero, and drops the error that described the payload
+that is no longer there.
+
+Only a rejection can be amended. An exhausted change ran out of attempts without
+ever getting an answer, so nobody knows whether the server applied it, and a new
+key is exactly how it would be applied a second time — `amend` throws rather
+than do that quietly. `retry(id)`, under the key the server can recognise, is
+the move for that one.
 
 ## In order, but not one at a time
 
@@ -357,8 +381,8 @@ which is the exact thing this exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, a stored value that is not a queue read as an empty one, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
-| Not yet | keeping a value that is not a queue aside instead of discarding it, editing the payload of a parked change before requeueing it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, a stored value that is not a queue read as an empty one, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, amending a rejected change with a new payload under a fresh key, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
+| Not yet | keeping a value that is not a queue aside instead of discarding it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
 
 ## Development
 
