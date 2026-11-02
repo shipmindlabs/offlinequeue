@@ -251,6 +251,9 @@ export class OfflineQueue {
    * to have died with its process and the row goes back to pending, where the
    * idempotency key is what makes sending it again safe.
    *
+   * Times a stepped-back clock left ahead of the present are corrected first,
+   * so a row is not held in flight or kept waiting for the size of the step.
+   *
    * Reclaiming changes nothing but the state, so a second pass finds nothing
    * and writes nothing. Safe to call on every cold start, foreground or
    * reconnect.
@@ -258,13 +261,14 @@ export class OfflineQueue {
   async recover(): Promise<number> {
     await this.load();
     const now = this.#options.now().getTime();
+    const corrected = this.#correctStoredTimes(now);
     const stuck = this.#operations.filter(
       (operation) => operation.state === "in-flight" && this.#leaseExpired(operation, now),
     );
     for (const operation of stuck) {
       this.#replace(operation.id, { state: "pending", startedAt: undefined });
     }
-    if (stuck.length > 0) await this.#persist();
+    if (stuck.length > 0 || corrected > 0) await this.#persist();
     return stuck.length;
   }
 
@@ -366,6 +370,9 @@ export class OfflineQueue {
 
     const signal = options.signal;
     const now = this.#options.now();
+    // A clock that stepped back left stored times ahead of the present, and a
+    // row must not wait out the size of the step before it is tried again.
+    this.#correctStoredTimes(now.getTime());
     const tally: Tally = { sent: 0, rejected: 0, exhausted: 0, retrying: 0 };
 
     const lanes = new Map<string, Operation[]>();
@@ -599,6 +606,39 @@ export class OfflineQueue {
       nextAttemptAt: undefined,
       startedAt: undefined,
     });
+  }
+
+  /**
+   * Bring stored times that are ahead of the present back into the present, and
+   * answer how many rows were rewritten.
+   *
+   * A device clock can step back — a user correcting it, or the network telling
+   * the phone the truth — and every time already written is then ahead of now
+   * by the size of the step. Left alone, a lease has not run out for an hour
+   * and a backoff has not elapsed since yesterday: the queue waits out a step
+   * nobody asked it to serve.
+   *
+   * A `startedAt` ahead of now becomes now, so the lease runs once from the
+   * corrected clock rather than from a moment that has not happened — the
+   * attempt may still be on the wire, and reclaiming it on sight would be the
+   * duplicate the lease exists to prevent. A `nextAttemptAt` further ahead than
+   * the backoff could ever have set it is capped to `maxDelayMs`, which is the
+   * longest wait the policy allows.
+   */
+  #correctStoredTimes(now: number): number {
+    const ceiling = now + this.#options.maxDelayMs;
+    let corrected = 0;
+    for (const operation of [...this.#operations]) {
+      const changes: { startedAt?: string; nextAttemptAt?: string } = {};
+      const startedAt = operation.startedAt ? Date.parse(operation.startedAt) : NaN;
+      if (startedAt > now) changes.startedAt = new Date(now).toISOString();
+      const nextAttemptAt = operation.nextAttemptAt ? Date.parse(operation.nextAttemptAt) : NaN;
+      if (nextAttemptAt > ceiling) changes.nextAttemptAt = new Date(ceiling).toISOString();
+      if (changes.startedAt === undefined && changes.nextAttemptAt === undefined) continue;
+      this.#replace(operation.id, changes);
+      corrected++;
+    }
+    return corrected;
   }
 
   #leaseExpired(operation: Operation, now: number): boolean {

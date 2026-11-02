@@ -157,6 +157,17 @@ not go up: an attempt whose outcome nobody recorded is not spent, so being
 killed mid-request never parks a change. A row in flight with no `startedAt` has
 an unknown age, and is reclaimed on sight.
 
+**A stored time from the future is not waited out.** A device clock steps back —
+a user corrects it, or the network tells the phone the truth about a date it
+guessed on boot — and every time already written is then ahead of the present by
+the size of the step: a lease that will not run out for an hour, a backoff that
+has not elapsed since yesterday. So a `startedAt` ahead of now is rewritten to
+now, and the lease runs once from the corrected clock rather than being thrown
+away, because the request may still be on the wire; a `nextAttemptAt` further
+ahead than the backoff could ever have set it is capped to `maxDelayMs`.
+`load`, `recover` and `flush` all do this on the way in, and a device whose
+clock never moved is never written to for it.
+
 **rejected or exhausted → pending.** `retry(id)`, with `attempts` back to zero
 and `parkedReason` cleared, under the original idempotency key.
 `amend(id, payload)` is the same move for a rejection the user has fixed, and it
@@ -381,7 +392,7 @@ which is the exact thing this exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, a stored value that is not a queue read as an empty one, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, amending a rejected change with a new payload under a fresh key, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, a stored value that is not a queue read as an empty one, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, stored times ahead of the present corrected when the device clock steps back, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, amending a rejected change with a new payload under a fresh key, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
 | Not yet | keeping a value that is not a queue aside instead of discarding it, a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
 
 ## Development
