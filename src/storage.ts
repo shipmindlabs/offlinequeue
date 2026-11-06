@@ -30,43 +30,78 @@ export type SyncKeyValueStore = {
   set(key: string, value: string): void;
 };
 
+/** What was found under the key instead of a queue, and where it was kept. */
+export type QuarantineEvent = {
+  readonly key: string;
+  readonly quarantineKey: string;
+  readonly error: string;
+};
+
+export type StorageOptions = {
+  /**
+   * Told that the value under the key was not a queue, once the bytes have been
+   * copied aside. `load` answers with operations, so without this an app cannot
+   * tell a store that held something unreadable from one that held nothing.
+   */
+  readonly onQuarantine?: (event: QuarantineEvent) => void;
+};
+
 const defaultKey = "offlinequeue";
+
+const notAnArray = "stored value is not an array";
+
+/** The queue found under the key, or why what was there is not one. */
+type Reading = { readonly operations: Operation[]; readonly error?: string };
 
 /**
  * Anything that is not an array of operations is not a queue. A store holding
  * something else — a key collision, a half-written value — reads as empty
- * rather than as a queue of nonsense.
+ * rather than as a queue of nonsense, and the reason travels so that the bytes
+ * can be kept aside rather than only dropped.
  *
  * A store that could not answer at all is a different failure and is not
  * handled here: it has said nothing about what the device holds, so it is not
  * turned into an empty queue.
  */
-function decode(raw: string | null | undefined): Operation[] {
-  if (!raw) return [];
+function decode(raw: string): Reading {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    return [];
+  } catch (error) {
+    return { operations: [], error: error instanceof Error ? error.message : String(error) };
   }
-  return Array.isArray(parsed) ? (parsed as Operation[]) : [];
+  if (!Array.isArray(parsed)) return { operations: [], error: notAnArray };
+  return { operations: parsed as Operation[] };
 }
 
 /**
  * Keep the queue in an asynchronous key-value store, under one key.
  *
  * A value that is not a queue reads as empty: a key collision or a half-written
- * value is bad, but an app that will not start is worse. A store that cannot be
- * read at all is the other case, and that failure travels — a read that failed
- * is not knowledge that the device holds nothing, and the queue must not write
- * over what it never saw. A failed write is not swallowed either: that would
- * lose a change silently, which is the exact failure this library exists to
- * prevent.
+ * value is bad, but an app that will not start is worse. The bytes are copied
+ * to `${key}.quarantine` and `onQuarantine` says so, so a value nobody expected
+ * can still be looked at. A store that cannot be read at all is the other case,
+ * and that failure travels — a read that failed is not knowledge that the
+ * device holds nothing, and the queue must not write over what it never saw. A
+ * failed write is not swallowed either: that would lose a change silently,
+ * which is the exact failure this library exists to prevent.
  */
-export function keyValueStorage(store: KeyValueStore, key = defaultKey): Storage {
+export function keyValueStorage(
+  store: KeyValueStore,
+  key = defaultKey,
+  options: StorageOptions = {},
+): Storage {
+  const quarantineKey = `${key}.quarantine`;
   return {
     async load() {
-      return decode(await store.getItem(key));
+      const raw = await store.getItem(key);
+      if (!raw) return [];
+      const read = decode(raw);
+      if (read.error !== undefined) {
+        await store.setItem(quarantineKey, raw);
+        options.onQuarantine?.({ key, quarantineKey, error: read.error });
+      }
+      return read.operations;
     },
     async save(operations) {
       await store.setItem(key, JSON.stringify(operations));
@@ -79,13 +114,25 @@ export function keyValueStorage(store: KeyValueStore, key = defaultKey): Storage
  *
  * MMKV is synchronous, so the write has already happened by the time the
  * promise resolves; the asynchronous signature exists only so that the same
- * queue can also hold an AsyncStorage. Read and write failures are handled the
- * same way as above, for the same reasons.
+ * queue can also hold an AsyncStorage. Read and write failures, and a value
+ * that is not a queue, are handled the same way as above, for the same reasons.
  */
-export function mmkvStorage(store: SyncKeyValueStore, key = defaultKey): Storage {
+export function mmkvStorage(
+  store: SyncKeyValueStore,
+  key = defaultKey,
+  options: StorageOptions = {},
+): Storage {
+  const quarantineKey = `${key}.quarantine`;
   return {
     async load() {
-      return decode(store.getString(key));
+      const raw = store.getString(key);
+      if (!raw) return [];
+      const read = decode(raw);
+      if (read.error !== undefined) {
+        store.set(quarantineKey, raw);
+        options.onQuarantine?.({ key, quarantineKey, error: read.error });
+      }
+      return read.operations;
     },
     async save(operations) {
       store.set(key, JSON.stringify(operations));

@@ -8,6 +8,7 @@ import {
   OfflineQueue,
   type KeyValueStore,
   type Operation,
+  type QuarantineEvent,
   type Storage,
   type SyncKeyValueStore,
 } from "../src/index.ts";
@@ -56,12 +57,15 @@ function row(id: string, kind: string): Operation {
 const adapters: ReadonlyArray<{
   name: string;
   open: (cells: Cells, key?: string) => Storage;
+  watched: (cells: Cells, onQuarantine: (event: QuarantineEvent) => void) => Storage;
   unreadable: () => Storage;
   unwritable: () => Storage;
 }> = [
   {
     name: "AsyncStorage",
     open: (cells, key) => keyValueStorage(asyncStoreOver(cells), key),
+    watched: (cells, onQuarantine) =>
+      keyValueStorage(asyncStoreOver(cells), undefined, { onQuarantine }),
     unreadable: () =>
       keyValueStorage({ getItem: async () => "{not json", setItem: async () => {} }),
     unwritable: () => keyValueStorage(asyncStoreOver(new Map(), true)),
@@ -69,6 +73,7 @@ const adapters: ReadonlyArray<{
   {
     name: "MMKV",
     open: (cells, key) => mmkvStorage(mmkvOver(cells), key),
+    watched: (cells, onQuarantine) => mmkvStorage(mmkvOver(cells), undefined, { onQuarantine }),
     unreadable: () => mmkvStorage({ getString: () => "{not json", set: () => {} }),
     unwritable: () => mmkvStorage(mmkvOver(new Map(), true)),
   },
@@ -143,6 +148,49 @@ for (const adapter of adapters) {
   test(`${adapter.name}: a stored value that is not a queue reads as empty`, async () => {
     const cells: Cells = new Map([["offlinequeue", JSON.stringify({ migrated: true })]]);
     assert.deepEqual(await adapter.open(cells).load(), []);
+  });
+
+  // `load` answers with operations, so an app that is told nothing cannot tell a
+  // store that held something unreadable from one that held nothing at all.
+  test(`${adapter.name}: bytes that do not parse are kept aside and reported`, async () => {
+    const cells: Cells = new Map([["offlinequeue", "{not json"]]);
+    const quarantined: QuarantineEvent[] = [];
+    const storage = adapter.watched(cells, (event) => quarantined.push(event));
+
+    assert.deepEqual(await storage.load(), []);
+
+    assert.equal(quarantined.length, 1, "once, on the way in");
+    assert.equal(quarantined[0]?.key, "offlinequeue");
+    assert.equal(quarantined[0]?.quarantineKey, "offlinequeue.quarantine");
+    assert.match(quarantined[0]?.error ?? "", /JSON/, "the parser's own complaint");
+    assert.equal(cells.get("offlinequeue.quarantine"), "{not json", "the bytes themselves survive");
+  });
+
+  test(`${adapter.name}: valid JSON of another shape is reported as not a queue`, async () => {
+    const cells: Cells = new Map([["offlinequeue", JSON.stringify({ migrated: true })]]);
+    const quarantined: QuarantineEvent[] = [];
+    const storage = adapter.watched(cells, (event) => quarantined.push(event));
+
+    assert.deepEqual(await storage.load(), []);
+
+    assert.equal(quarantined.length, 1);
+    assert.equal(quarantined[0]?.error, "stored value is not an array");
+    assert.equal(quarantined[0]?.quarantineKey, "offlinequeue.quarantine");
+    assert.equal(cells.get("offlinequeue.quarantine"), '{"migrated":true}');
+  });
+
+  test(`${adapter.name}: nothing stored, and a queue, are not quarantined`, async () => {
+    const quarantined: QuarantineEvent[] = [];
+    const report = (event: QuarantineEvent) => quarantined.push(event);
+
+    const empty: Cells = new Map();
+    assert.deepEqual(await adapter.watched(empty, report).load(), []);
+
+    const held: Cells = new Map([["offlinequeue", JSON.stringify([row("op-1", "note")])]]);
+    assert.equal((await adapter.watched(held, report).load()).length, 1);
+
+    assert.deepEqual(quarantined, [], "a first run is not a device holding something unreadable");
+    assert.equal(empty.size, 0, "and a load that found nothing wrote nothing");
   });
 
   test(`${adapter.name}: a second key holds a separate queue`, async () => {

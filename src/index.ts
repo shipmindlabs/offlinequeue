@@ -24,5 +24,7 @@ export {
   memoryStorage,
   mmkvStorage,
   type KeyValueStore,
+  type QuarantineEvent,
+  type StorageOptions,
   type SyncKeyValueStore,
 } from "./storage.ts";
