@@ -374,6 +374,15 @@ keyValueStorage(AsyncStorage, "offlinequeue", {
 nothing under it is not a quarantine, and neither is a value that reads as a
 queue: a first run is not a device holding something nobody can explain.
 
+The copy comes before the empty queue, so the write that replaces the stored
+value replaces something that still exists elsewhere. It is never a write over
+an earlier copy: if `${key}.quarantine` already holds different bytes, `load`
+throws, the queue stays unloaded, and both cells are left exactly as they were —
+that slot is the only copy of a value nobody could read, and keeping the newer
+one at its expense is the loss the quarantine exists to prevent. A quarantine
+write that itself fails ends the load for the same reason: a copy that did not
+land is not a copy.
+
 ## No React Native import
 
 Storage, transport and connectivity arrive as functions. `AsyncStorage` fits
@@ -401,7 +410,8 @@ half-written value is bad, and an app that will not start is worse, so a value
 that cannot be decoded is not passed on as a failure — the queue starts empty
 and the next write replaces it. The bytes are copied to `${key}.quarantine`
 first and `onQuarantine` says so, so what was there can be looked at rather than
-only vanishing.
+only vanishing. If that copy cannot be made — the slot already holds different
+bytes, or the write fails — the load fails instead, and nothing is written over.
 
 **A write that failed throws.** Swallowing it would lose a change silently,
 which is the exact thing this exists to prevent.
@@ -410,7 +420,7 @@ which is the exact thing this exists to prevent.
 
 | | |
 |---|---|
-| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, a stored value that is not a queue read as an empty one, kept aside under `${key}.quarantine` and reported through `onQuarantine`, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, stored times ahead of the present corrected when the device clock steps back, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, amending a rejected change with a new payload under a fresh key, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
+| Implemented | durable enqueue, device-generated idempotency keys that dedupe on enqueue and stay stable across restarts and retries, AsyncStorage / MMKV / in-memory adapters behind one interface, a failed read that travels rather than being taken for an empty queue, a stored value that is not a queue read as an empty one, kept aside under `${key}.quarantine` and reported through `onQuarantine`, a quarantine slot that is already occupied ending the load rather than being written over, exponential backoff with per-item jitter and a ceiling, in-flight leases with idempotent recovery of abandoned attempts, stored times ahead of the present corrected when the device clock steps back, an attempt limit, parking that keeps the last error and why it stopped, requeueing or discarding a parked change, amending a rejected change with a new payload under a fresh key, ordering per entity with unrelated entities flushed concurrently under a limit, flushing on connectivity events with cancellation and no timers, prune |
 | Not yet | a conflict-resolution hook for `409`, batching several operations into one request, a React hook wrapping `start`, encryption at rest |
 
 ## Development

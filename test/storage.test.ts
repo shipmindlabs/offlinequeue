@@ -8,6 +8,7 @@ import {
   OfflineQueue,
   type KeyValueStore,
   type Operation,
+  type Outcome,
   type QuarantineEvent,
   type Storage,
   type SyncKeyValueStore,
@@ -50,6 +51,15 @@ function row(id: string, kind: string): Operation {
   };
 }
 
+function queueOn(storage: Storage) {
+  return new OfflineQueue({
+    storage,
+    send: async (): Promise<Outcome> => ({ result: "done" }),
+    now: at("2026-08-16T10:00:00Z"),
+    random: () => 0.5,
+  });
+}
+
 /**
  * Both real adapters answer the same interface, so they answer the same tests.
  * An adapter that passes these is one the queue can be trusted to run on.
@@ -58,6 +68,8 @@ const adapters: ReadonlyArray<{
   name: string;
   open: (cells: Cells, key?: string) => Storage;
   watched: (cells: Cells, onQuarantine: (event: QuarantineEvent) => void) => Storage;
+  /** The same device, on a store that refuses every write. */
+  sealed: (cells: Cells) => Storage;
   unreadable: () => Storage;
   unwritable: () => Storage;
 }> = [
@@ -66,6 +78,7 @@ const adapters: ReadonlyArray<{
     open: (cells, key) => keyValueStorage(asyncStoreOver(cells), key),
     watched: (cells, onQuarantine) =>
       keyValueStorage(asyncStoreOver(cells), undefined, { onQuarantine }),
+    sealed: (cells) => keyValueStorage(asyncStoreOver(cells, true)),
     unreadable: () =>
       keyValueStorage({ getItem: async () => "{not json", setItem: async () => {} }),
     unwritable: () => keyValueStorage(asyncStoreOver(new Map(), true)),
@@ -74,6 +87,7 @@ const adapters: ReadonlyArray<{
     name: "MMKV",
     open: (cells, key) => mmkvStorage(mmkvOver(cells), key),
     watched: (cells, onQuarantine) => mmkvStorage(mmkvOver(cells), undefined, { onQuarantine }),
+    sealed: (cells) => mmkvStorage(mmkvOver(cells, true)),
     unreadable: () => mmkvStorage({ getString: () => "{not json", set: () => {} }),
     unwritable: () => mmkvStorage(mmkvOver(new Map(), true)),
   },
@@ -191,6 +205,57 @@ for (const adapter of adapters) {
 
     assert.deepEqual(quarantined, [], "a first run is not a device holding something unreadable");
     assert.equal(empty.size, 0, "and a load that found nothing wrote nothing");
+  });
+
+  // The copy is what makes the next write a replacement rather than a loss: the
+  // queue starts empty, and the value it started empty over is still readable.
+  test(`${adapter.name}: the next write replaces bytes that survive in the quarantine key`, async () => {
+    const cells: Cells = new Map([["offlinequeue", "{not json"]]);
+
+    await queueOn(adapter.open(cells)).enqueue("note", { text: "hello" });
+
+    assert.equal(cells.get("offlinequeue.quarantine"), "{not json", "kept, byte for byte");
+    const stored = JSON.parse(cells.get("offlinequeue") ?? "null") as Operation[];
+    assert.equal(stored.length, 1, "and the key holds the new queue");
+    assert.deepEqual(stored[0]?.payload, { text: "hello" });
+  });
+
+  // The slot holds the only copy of an earlier unreadable value. Keeping the
+  // newer bytes at its expense is the loss the quarantine exists to prevent.
+  test(`${adapter.name}: an occupied quarantine key stops the load instead`, async () => {
+    const cells: Cells = new Map([
+      ["offlinequeue", "{not json"],
+      ["offlinequeue.quarantine", "[half a queue"],
+    ]);
+    const queue = queueOn(adapter.open(cells));
+
+    await assert.rejects(
+      () => queue.enqueue("note", { text: "hello" }),
+      /already holds an unread queue/,
+    );
+
+    assert.equal(cells.get("offlinequeue"), "{not json", "neither cell moved");
+    assert.equal(cells.get("offlinequeue.quarantine"), "[half a queue");
+  });
+
+  // A copy that did not land is not a copy, so the queue does not carry on to
+  // write over the value it failed to keep.
+  test(`${adapter.name}: a quarantine that cannot be written leaves the bytes where they are`, async () => {
+    const cells: Cells = new Map([["offlinequeue", "{not json"]]);
+    const queue = queueOn(adapter.sealed(cells));
+
+    await assert.rejects(() => queue.enqueue("note", { text: "hello" }), /disk full/);
+
+    assert.equal(cells.get("offlinequeue"), "{not json");
+    assert.equal(cells.has("offlinequeue.quarantine"), false, "and no half-kept copy was left");
+  });
+
+  test(`${adapter.name}: a device holding nothing is given no quarantine key`, async () => {
+    const cells: Cells = new Map();
+
+    await queueOn(adapter.open(cells)).enqueue("note", { text: "hello" });
+
+    assert.deepEqual([...cells.keys()], ["offlinequeue"], "a first run quarantines nothing");
   });
 
   test(`${adapter.name}: a second key holds a separate queue`, async () => {

@@ -50,6 +50,15 @@ const defaultKey = "offlinequeue";
 
 const notAnArray = "stored value is not an array";
 
+/**
+ * The quarantine key is one slot, and the bytes in it are the only copy of a
+ * value nobody could read. Keeping the newer one at the cost of the older is
+ * the loss this whole path exists to prevent, so the load fails instead.
+ */
+const occupied = (quarantineKey: string, key: string) =>
+  `${quarantineKey} already holds an unread queue, and the value under ${key} ` +
+  `cannot be kept aside without writing over it`;
+
 /** The queue found under the key, or why what was there is not one. */
 type Reading = { readonly operations: Operation[]; readonly error?: string };
 
@@ -79,12 +88,17 @@ function decode(raw: string): Reading {
  *
  * A value that is not a queue reads as empty: a key collision or a half-written
  * value is bad, but an app that will not start is worse. The bytes are copied
- * to `${key}.quarantine` and `onQuarantine` says so, so a value nobody expected
- * can still be looked at. A store that cannot be read at all is the other case,
- * and that failure travels — a read that failed is not knowledge that the
- * device holds nothing, and the queue must not write over what it never saw. A
- * failed write is not swallowed either: that would lose a change silently,
- * which is the exact failure this library exists to prevent.
+ * to `${key}.quarantine` first — so the next `save` replaces a value that still
+ * exists somewhere — and `onQuarantine` says so. That copy is never a write
+ * over an earlier one: a quarantine slot already holding different bytes, and a
+ * quarantine write that failed, both end the load, which leaves the queue
+ * unloaded and every cell as it was.
+ *
+ * A store that cannot be read at all is the other case, and that failure
+ * travels — a read that failed is not knowledge that the device holds nothing,
+ * and the queue must not write over what it never saw. A failed write is not
+ * swallowed either: that would lose a change silently, which is the exact
+ * failure this library exists to prevent.
  */
 export function keyValueStorage(
   store: KeyValueStore,
@@ -98,6 +112,8 @@ export function keyValueStorage(
       if (!raw) return [];
       const read = decode(raw);
       if (read.error !== undefined) {
+        const kept = await store.getItem(quarantineKey);
+        if (kept && kept !== raw) throw new Error(occupied(quarantineKey, key));
         await store.setItem(quarantineKey, raw);
         options.onQuarantine?.({ key, quarantineKey, error: read.error });
       }
@@ -129,6 +145,8 @@ export function mmkvStorage(
       if (!raw) return [];
       const read = decode(raw);
       if (read.error !== undefined) {
+        const kept = store.getString(quarantineKey);
+        if (kept && kept !== raw) throw new Error(occupied(quarantineKey, key));
         store.set(quarantineKey, raw);
         options.onQuarantine?.({ key, quarantineKey, error: read.error });
       }
