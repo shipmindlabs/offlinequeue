@@ -77,6 +77,50 @@ const exhaustedCharge: Operation = {
   lastError: "offline",
 };
 
+/** A row the server refused, as a previous run left it. */
+const rejectedNote: Operation = {
+  id: "op-2",
+  kind: "note",
+  payload: { title: "" },
+  idempotencyKey: "key-note",
+  createdAt: "2026-08-16T09:00:00.000Z",
+  attempts: 1,
+  state: "failed",
+  parkedReason: "rejected",
+  lastError: "title is required",
+};
+
+/** A store whose first read fails and whose later reads work. */
+function throwsOnceOnRead(inner: Storage): Storage {
+  let thrown = false;
+  return {
+    load: async () => {
+      if (thrown) return inner.load();
+      thrown = true;
+      throw new Error("storage unavailable");
+    },
+    save: (operations) => inner.save(operations),
+  };
+}
+
+/** The same store, until it is sealed and refuses every further write. */
+function sealable(inner: Storage) {
+  let sealed = false;
+  const storage: Storage = {
+    load: () => inner.load(),
+    save: async (operations) => {
+      if (sealed) throw new Error("disk full");
+      await inner.save(operations);
+    },
+  };
+  return {
+    storage,
+    seal: () => {
+      sealed = true;
+    },
+  };
+}
+
 test("an amended rejection is pending again, with the new payload and a new key", async () => {
   const api = server();
   const q = queue(api.send);
@@ -179,4 +223,92 @@ test("the amended change answers to its new key", async () => {
 
   assert.equal(again.id, amended.id);
   assert.equal(q.operations.length, 1);
+});
+
+// A fix that is itself refused is still a rejection, so the way out is the same
+// one — and each payload the server has not seen travels under its own key.
+test("an amendment the server also refuses can be amended again", async () => {
+  const api = server();
+  const q = queue(api.send);
+  const note = await q.enqueue("note", { title: "" });
+  await q.flush();
+
+  await q.amend(note.id, { title: "" });
+  await q.flush();
+  assert.equal(q.failed[0]?.parkedReason, "rejected", "refused on its content again");
+  assert.equal(q.failed[0]?.attempts, 1, "one attempt, under the second key");
+
+  const fixed = await q.amend(note.id, { title: "Dinner" });
+  const report = await q.flush();
+
+  assert.equal(report.sent, 1);
+  assert.equal(fixed.idempotencyKey, "key-3");
+  assert.deepEqual(api.received, ["key-1", "key-2", "key-3"], "three payloads, three keys");
+  assert.deepEqual(api.applied, [{ title: "Dinner" }], "and one of them applied");
+  assert.equal(q.operations.length, 1, "still one row");
+});
+
+// What cannot be amended is an exhausted row, not a row that was once
+// exhausted: `retry` under the original key is how it gets an answer, and an
+// answer is what makes the fix safe to send under a new one.
+test("an exhausted change the server then refuses can be amended", async () => {
+  const received: string[] = [];
+  const q = queue(async (operation) => {
+    received.push(operation.idempotencyKey);
+    return (operation.payload as { card?: string }).card
+      ? { result: "done" }
+      : { result: "rejected", reason: "no payment method" };
+  }, memoryStorage([exhaustedCharge]));
+  await q.load();
+
+  await assert.rejects(() => q.amend("op-1", { amount: 100, card: "4242" }), /exhausted/);
+
+  await q.retry("op-1");
+  await q.flush();
+  assert.equal(q.failed[0]?.parkedReason, "rejected", "this time the server answered");
+
+  const amended = await q.amend("op-1", { amount: 100, card: "4242" });
+  const report = await q.flush();
+
+  assert.equal(report.sent, 1);
+  assert.notEqual(amended.idempotencyKey, "key-abc", "the fix is a request of its own");
+  assert.deepEqual(received, ["key-abc", "key-1"]);
+});
+
+// An amendment is a write before it is anything else: a fix the device could
+// not record must not be reported as made.
+test("an amendment the device could not store says so", async () => {
+  const cells = memoryStorage();
+  const device = sealable(cells);
+  const api = server();
+  const q = queue(api.send, device.storage);
+  const note = await q.enqueue("note", { title: "" });
+  await q.flush();
+
+  device.seal();
+  await assert.rejects(() => q.amend(note.id, { title: "Dinner" }), /disk full/);
+
+  const stored = (await cells.load())[0];
+  assert.equal(stored?.state, "failed", "the device still holds the change that was refused");
+  assert.equal(stored?.parkedReason, "rejected");
+  assert.deepEqual(stored?.payload, { title: "" }, "under the payload the server answered");
+  assert.equal(stored?.idempotencyKey, note.idempotencyKey, "and the key it answered it under");
+});
+
+// A read that failed is not knowledge that the device holds nothing, and
+// amending is a write: it reads again rather than writing over what it never saw.
+test("an amendment over a failed read touches nothing", async () => {
+  const cells = memoryStorage([rejectedNote]);
+  const api = server();
+  const q = queue(api.send, throwsOnceOnRead(cells));
+
+  await assert.rejects(() => q.amend("op-2", { title: "Dinner" }), /storage unavailable/);
+  assert.deepEqual((await cells.load())[0]?.payload, { title: "" }, "nothing was written");
+  assert.equal((await cells.load())[0]?.state, "failed");
+
+  const amended = await q.amend("op-2", { title: "Dinner" });
+
+  assert.deepEqual(amended.payload, { title: "Dinner" }, "the next call reads again");
+  assert.equal((await cells.load())[0]?.state, "pending");
+  assert.notEqual((await cells.load())[0]?.idempotencyKey, "key-note");
 });

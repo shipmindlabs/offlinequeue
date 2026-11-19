@@ -67,7 +67,11 @@ function queueOn(storage: Storage) {
 const adapters: ReadonlyArray<{
   name: string;
   open: (cells: Cells, key?: string) => Storage;
-  watched: (cells: Cells, onQuarantine: (event: QuarantineEvent) => void) => Storage;
+  watched: (
+    cells: Cells,
+    onQuarantine: (event: QuarantineEvent) => void,
+    key?: string,
+  ) => Storage;
   /** The same device, on a store that refuses every write. */
   sealed: (cells: Cells) => Storage;
   unreadable: () => Storage;
@@ -76,8 +80,8 @@ const adapters: ReadonlyArray<{
   {
     name: "AsyncStorage",
     open: (cells, key) => keyValueStorage(asyncStoreOver(cells), key),
-    watched: (cells, onQuarantine) =>
-      keyValueStorage(asyncStoreOver(cells), undefined, { onQuarantine }),
+    watched: (cells, onQuarantine, key) =>
+      keyValueStorage(asyncStoreOver(cells), key, { onQuarantine }),
     sealed: (cells) => keyValueStorage(asyncStoreOver(cells, true)),
     unreadable: () =>
       keyValueStorage({ getItem: async () => "{not json", setItem: async () => {} }),
@@ -86,7 +90,7 @@ const adapters: ReadonlyArray<{
   {
     name: "MMKV",
     open: (cells, key) => mmkvStorage(mmkvOver(cells), key),
-    watched: (cells, onQuarantine) => mmkvStorage(mmkvOver(cells), undefined, { onQuarantine }),
+    watched: (cells, onQuarantine, key) => mmkvStorage(mmkvOver(cells), key, { onQuarantine }),
     sealed: (cells) => mmkvStorage(mmkvOver(cells, true)),
     unreadable: () => mmkvStorage({ getString: () => "{not json", set: () => {} }),
     unwritable: () => mmkvStorage(mmkvOver(new Map(), true)),
@@ -193,6 +197,18 @@ for (const adapter of adapters) {
     assert.equal(cells.get("offlinequeue.quarantine"), '{"migrated":true}');
   });
 
+  // JSON that parses to nothing is still not a queue: an empty array is the one
+  // shape that says the device holds no changes.
+  test(`${adapter.name}: a stored null is a value that is not a queue`, async () => {
+    const cells: Cells = new Map([["offlinequeue", "null"]]);
+    const quarantined: QuarantineEvent[] = [];
+
+    assert.deepEqual(await adapter.watched(cells, (event) => quarantined.push(event)).load(), []);
+
+    assert.equal(quarantined[0]?.error, "stored value is not an array");
+    assert.equal(cells.get("offlinequeue.quarantine"), "null", "kept aside like any other value");
+  });
+
   test(`${adapter.name}: nothing stored, and a queue, are not quarantined`, async () => {
     const quarantined: QuarantineEvent[] = [];
     const report = (event: QuarantineEvent) => quarantined.push(event);
@@ -205,6 +221,18 @@ for (const adapter of adapters) {
 
     assert.deepEqual(quarantined, [], "a first run is not a device holding something unreadable");
     assert.equal(empty.size, 0, "and a load that found nothing wrote nothing");
+  });
+
+  // A key holding no bytes is a key holding nothing, whichever of the two stores
+  // wrote it — there is no value to keep aside and nothing to report.
+  test(`${adapter.name}: an empty value under the key is nothing stored`, async () => {
+    const cells: Cells = new Map([["offlinequeue", ""]]);
+    const quarantined: QuarantineEvent[] = [];
+
+    assert.deepEqual(await adapter.watched(cells, (event) => quarantined.push(event)).load(), []);
+
+    assert.deepEqual(quarantined, []);
+    assert.equal(cells.has("offlinequeue.quarantine"), false);
   });
 
   // The copy is what makes the next write a replacement rather than a loss: the
@@ -238,6 +266,22 @@ for (const adapter of adapters) {
     assert.equal(cells.get("offlinequeue.quarantine"), "[half a queue");
   });
 
+  // The slot being occupied by the very same bytes is not the collision that
+  // ends a load: a run that quarantined a value and then wrote nothing leaves
+  // exactly that, and the next run must still start.
+  test(`${adapter.name}: a value already kept aside is kept aside again, not refused`, async () => {
+    const cells: Cells = new Map([["offlinequeue", "{not json"]]);
+    const quarantined: QuarantineEvent[] = [];
+    const report = (event: QuarantineEvent) => quarantined.push(event);
+
+    assert.deepEqual(await adapter.watched(cells, report).load(), []);
+    assert.deepEqual(await adapter.watched(cells, report).load(), [], "and a second run too");
+
+    assert.equal(quarantined.length, 2, "the app hears about it each time it is read");
+    assert.equal(cells.get("offlinequeue.quarantine"), "{not json");
+    assert.equal(cells.get("offlinequeue"), "{not json", "the value is not moved, only copied");
+  });
+
   // A copy that did not land is not a copy, so the queue does not carry on to
   // write over the value it failed to keep.
   test(`${adapter.name}: a quarantine that cannot be written leaves the bytes where they are`, async () => {
@@ -267,6 +311,41 @@ for (const adapter of adapters) {
 
     assert.equal((await drafts.load()).length, 1);
     assert.deepEqual(await uploads.load(), [], "two queues in one app do not see each other");
+  });
+
+  // Two queues in one app must not share a quarantine slot either, or the
+  // unreadable value of one would be the occupied slot of the other.
+  test(`${adapter.name}: each key keeps its unreadable value in its own slot`, async () => {
+    const cells: Cells = new Map([
+      ["drafts", "{not json"],
+      ["uploads", JSON.stringify([row("op-1", "note")])],
+    ]);
+    const quarantined: QuarantineEvent[] = [];
+    const report = (event: QuarantineEvent) => quarantined.push(event);
+
+    assert.deepEqual(await adapter.watched(cells, report, "drafts").load(), []);
+    assert.equal((await adapter.watched(cells, report, "uploads").load()).length, 1);
+
+    assert.equal(quarantined.length, 1, "only one of the two held something unreadable");
+    assert.equal(quarantined[0]?.key, "drafts");
+    assert.equal(quarantined[0]?.quarantineKey, "drafts.quarantine");
+    assert.equal(cells.get("drafts.quarantine"), "{not json");
+    assert.equal(cells.has("uploads.quarantine"), false, "the other queue is untouched");
+  });
+
+  // Several callers on an unloaded queue wait on one read, so the value under
+  // the key is decoded once and the app is told about it once.
+  test(`${adapter.name}: callers waiting on one read hear of the quarantine once`, async () => {
+    const cells: Cells = new Map([["offlinequeue", "{not json"]]);
+    const quarantined: QuarantineEvent[] = [];
+    const queue = queueOn(adapter.watched(cells, (event) => quarantined.push(event)));
+
+    await Promise.all([queue.load(), queue.enqueue("note", { text: "hello" })]);
+
+    assert.equal(quarantined.length, 1, "one read, one report");
+    assert.equal(cells.get("offlinequeue.quarantine"), "{not json");
+    const stored = JSON.parse(cells.get("offlinequeue") ?? "null") as Operation[];
+    assert.equal(stored.length, 1, "and the queue started from empty, once");
   });
 }
 
